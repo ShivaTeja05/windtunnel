@@ -1,0 +1,11 @@
+{
+  "name": "windtunnel",
+  "owner": { "name": "Shiva Teja" },
+  "plugins": [
+    {
+      "name": "windtunnel",
+      "source": "./",
+      "description": "Wind Tunnel MCP server plus a skill that calls it before choosing an AI architecture or model."
+    }
+  ]
+}

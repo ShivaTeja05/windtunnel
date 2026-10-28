@@ -1,0 +1,110 @@
+[
+  {
+    "id": "tmr",
+    "name": "Triple modular redundancy",
+    "field": "fault-tolerant computing",
+    "failure_modes": ["inconsistent", "reasoning_error"],
+    "idea": "Run three copies of the same unit and let a majority voter mask any single faulty one.",
+    "mutation": {"op": "add_voting", "n": 3},
+    "source": {"title": "Triple modular redundancy (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Triple_modular_redundancy"}
+  },
+  {
+    "id": "quorum",
+    "name": "Quorum consensus",
+    "field": "distributed systems",
+    "failure_modes": ["inconsistent"],
+    "idea": "Only commit a value once enough replicas vote for it, so one unstable replica cannot decide the outcome.",
+    "mutation": {"op": "add_voting", "n": 5},
+    "source": {"title": "Quorum (distributed computing) (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Quorum_(distributed_computing)"}
+  },
+  {
+    "id": "damping",
+    "name": "Damping",
+    "field": "control theory",
+    "failure_modes": ["inconsistent"],
+    "idea": "Shed the energy of an oscillating system so its swings die out; here, average many samples so answer-to-answer swings cancel.",
+    "mutation": {"op": "add_voting", "n": 7},
+    "source": {"title": "Damping (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Damping"}
+  },
+  {
+    "id": "ivv",
+    "name": "Independent verification and validation",
+    "field": "safety-critical software engineering",
+    "failure_modes": ["reasoning_error", "label_confusion"],
+    "idea": "A separate review pass checks the work against the requirements before it ships. Here the checker is the same model, so it is only partly independent.",
+    "mutation": {"op": "add_self_check"},
+    "source": {"title": "Software verification and validation (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Software_verification_and_validation"}
+  },
+  {
+    "id": "double-entry",
+    "name": "Double-entry bookkeeping",
+    "field": "accounting",
+    "failure_modes": ["inconsistent", "label_confusion"],
+    "idea": "Record every transaction twice and investigate whenever the two sides do not balance; here, answer twice cheaply and escalate to a stronger model when they disagree.",
+    "mutation": {"op": "switch_to_cascade", "cheap_model": "nano", "escalate_model": "ultra"},
+    "source": {"title": "Double-entry bookkeeping (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Double-entry_bookkeeping"}
+  },
+  {
+    "id": "checklist",
+    "name": "Surgical safety checklist",
+    "field": "medicine",
+    "failure_modes": ["format_violation", "reasoning_error"],
+    "idea": "Pause at fixed points and confirm a short list of items out loud, so routine slips are caught before they matter.",
+    "mutation": {"op": "add_instructions", "text": "Before the ANSWER line, run this checklist: (1) re-read the input and name the decisive detail; (2) confirm the answer follows from that detail; (3) confirm the answer uses the required format: {labels}."},
+    "source": {"title": "WHO Surgical Safety Checklist (Wikipedia)", "url": "https://en.wikipedia.org/wiki/WHO_Surgical_Safety_Checklist"}
+  },
+  {
+    "id": "poka-yoke",
+    "name": "Poka-yoke (mistake-proofing)",
+    "field": "manufacturing",
+    "failure_modes": ["format_violation"],
+    "idea": "Shape the process so the wrong part physically cannot fit; here, constrain the answer to the exact allowed strings.",
+    "mutation": {"op": "add_instructions", "text": "The ANSWER line must contain exactly one of these, copied character for character and nothing else: {labels}."},
+    "source": {"title": "Poka-yoke (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Poka-yoke"}
+  },
+  {
+    "id": "differential-diagnosis",
+    "name": "Differential diagnosis",
+    "field": "medicine",
+    "failure_modes": ["label_confusion"],
+    "idea": "List the conditions that look alike and name the finding that tells them apart before committing to one.",
+    "mutation": {"op": "add_instructions", "text": "These answers are often confused: {confusions}. When the input could fit more than one of them, name the detail that separates them before answering."},
+    "source": {"title": "Differential diagnosis (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Differential_diagnosis"}
+  },
+  {
+    "id": "triage",
+    "name": "Emergency triage",
+    "field": "emergency medicine",
+    "failure_modes": ["over_budget", "too_slow"],
+    "idea": "Sort cases by urgency so scarce expert attention goes only where it changes the outcome; here, a cheap model handles cases it is sure about and escalates the rest.",
+    "mutation": {"op": "switch_to_cascade", "cheap_model": "nano", "escalate_model": "super"},
+    "source": {"title": "Triage (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Triage"}
+  },
+  {
+    "id": "flight-plan",
+    "name": "Flight planning",
+    "field": "aviation",
+    "failure_modes": ["reasoning_error"],
+    "idea": "Work out the route, fuel and weather before take-off instead of improvising in the air; here, write a plan before answering.",
+    "mutation": {"op": "add_plan"},
+    "source": {"title": "Flight planning (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Flight_planning"}
+  },
+  {
+    "id": "referral",
+    "name": "Specialist referral",
+    "field": "medicine",
+    "failure_modes": ["reasoning_error", "label_confusion"],
+    "idea": "Hand cases the generalist keeps getting wrong to a more capable specialist; here, move the design up one model tier.",
+    "mutation": {"op": "upgrade_tier"},
+    "source": {"title": "Referral (medicine) (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Referral_(medicine)"}
+  },
+  {
+    "id": "load-shedding",
+    "name": "Load shedding",
+    "field": "power systems",
+    "failure_modes": ["over_budget", "too_slow", "pipeline_error"],
+    "idea": "Deliberately drop demand during a shortfall so the grid stays up; here, move the design down one model tier so it fits the cost, latency or timeout limits.",
+    "mutation": {"op": "downgrade_tier"},
+    "source": {"title": "Load shedding (Wikipedia)", "url": "https://en.wikipedia.org/wiki/Load_shedding"}
+  }
+]

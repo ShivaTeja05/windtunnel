@@ -12,7 +12,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 
-from .llm import LLMClient
+from .llm import LLMClient, Recorder
 from .scout import Source
 from .structured import ask_json
 from .understand import ProblemSpec, has_keyword
@@ -90,6 +90,15 @@ def _first_sentence(text: str, limit: int = 220) -> str:
     return sentence if len(sentence) <= limit else sentence[: limit - 1].rstrip() + "…"
 
 
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def _unsupported_numbers(result: str, abstract: str) -> list[str]:
+    """Numbers in a model-written result that do not appear in the abstract it was given."""
+    seen = {n.replace(",", "") for n in _NUMBER.findall(abstract)}
+    return [n for n in _NUMBER.findall(result) if n.replace(",", "") not in seen]
+
+
 def card_offline(source: Source, spec: ProblemSpec) -> MethodCard:
     words = {w for q in spec.search_queries for w in re.findall(r"[a-z]{4,}", q.lower())}
     hits = sum(1 for w in words if w in (source.title + " " + source.abstract).lower())
@@ -105,7 +114,7 @@ def card_offline(source: Source, spec: ProblemSpec) -> MethodCard:
         relevance_reason=f"{hits} search terms appear in the title or abstract",
         citation=_citation(source),
         verified=source.verified,
-        flags=_flags(source),
+        flags=_flags(source) + ([] if source.abstract.strip() else ["no-abstract"]),
         extracted_by="offline-heuristic",
     )
 
@@ -135,6 +144,14 @@ Return JSON with exactly these keys:
 
 
 def card_with_model(source: Source, spec: ProblemSpec, client: LLMClient, model: str = "super") -> MethodCard:
+    """A card written by the model from the source's abstract.
+
+    With no abstract there is nothing to summarise, so the offline card is used instead
+    of letting the model write from memory. A reported result whose numbers are not in
+    the abstract is dropped and the card is flagged "unverified-result".
+    """
+    if not source.abstract.strip():
+        return card_offline(source, spec)
     data, calls = ask_json(
         client,
         model,
@@ -144,12 +161,19 @@ def card_with_model(source: Source, spec: ProblemSpec, client: LLMClient, model:
             kind=source.kind,
             title=source.title,
             year=source.year or "n.d.",
-            abstract=source.abstract[:3000] or "(none)",
+            abstract=source.abstract[:3000],
             families=CARD_FAMILIES,
         ),
         max_tokens=700,
     )
+    if not isinstance(data, dict):
+        raise ValueError(f"card is a JSON {type(data).__name__}, not an object")
     family = str(data.get("family", "")).strip()
+    flags = _flags(source)
+    reported = str(data.get("reported_result", "")).strip()
+    if reported and _unsupported_numbers(reported, source.abstract[:3000]):
+        reported = ""  # numbers the abstract does not state are the model's, not the authors'
+        flags.append("unverified-result")
     try:
         relevance = max(0, min(3, int(data.get("relevance", 0))))
     except (TypeError, ValueError):
@@ -161,12 +185,12 @@ def card_with_model(source: Source, spec: ProblemSpec, client: LLMClient, model:
         mechanism=str(data.get("mechanism", "")).strip(),
         works_when=str(data.get("works_when", "")).strip(),
         breaks_when=str(data.get("breaks_when", "")).strip(),
-        reported_result=str(data.get("reported_result", "")).strip(),
+        reported_result=reported,
         relevance=relevance,
         relevance_reason=str(data.get("relevance_reason", "")).strip(),
         citation=_citation(source),
         verified=source.verified,
-        flags=_flags(source),
+        flags=flags,
         extracted_by=model,
         cost_usd=sum(c.cost_usd for c in calls),
     )
@@ -181,10 +205,13 @@ def extract_cards(
         return sorted(cards, key=lambda c: -c.relevance), []
 
     def run(source: Source):
+        recorder = Recorder(client)
         try:
-            return card_with_model(source, spec, client, model), None
+            return card_with_model(source, spec, recorder, model), None
         except Exception as exc:  # fall back rather than drop the source
-            return card_offline(source, spec), f"extraction fell back for {source.key}: {type(exc).__name__}"
+            card = card_offline(source, spec)
+            card.cost_usd = recorder.cost_usd  # paid for, even though unusable
+            return card, f"extraction fell back for {source.key}: {type(exc).__name__}"
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(run, sources))

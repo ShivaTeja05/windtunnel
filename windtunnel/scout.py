@@ -71,6 +71,8 @@ class Source:
         return {**asdict(self), "key": self.key, "verified": self.verified, "recent": self.recent, "long_tail": self.long_tail}
 
     def merge(self, other: Source) -> None:
+        if self.kind == "web" and other.kind == "paper":  # an index record beats a web page for the same title
+            self.kind, self.url = other.kind, other.url
         for name in ("abstract", "venue", "arxiv_id", "doi", "year", "citation_count"):
             if not getattr(self, name) and getattr(other, name):
                 setattr(self, name, getattr(other, name))
@@ -271,6 +273,13 @@ class ScoutResult:
         }
 
 
+def _dedup_keys(s: Source) -> list[str]:
+    keys = [f"arxiv:{s.arxiv_id}"] if s.arxiv_id else []
+    keys += [f"doi:{s.doi.lower()}"] if s.doi else []
+    title = re.sub(r"\W+", " ", s.title.lower()).strip()
+    return keys + ([f"title:{title}"] if title else [])
+
+
 def scout(
     spec: ProblemSpec,
     *,
@@ -304,18 +313,23 @@ def scout(
             warnings.append(warning)
         per_query_lists.setdefault(query, []).extend(found)
 
-    merged: dict[str, Source] = {}
-    order: list[str] = []
+    # One record per paper: the arXiv preprint and the published DOI version share a title,
+    # so any matching arXiv ID, DOI or normalised title merges into the existing entry.
+    index: dict[str, Source] = {}
+    order: list[Source] = []
     # Round-robin across queries so every approach family gets represented.
     lists = list(per_query_lists.values())
     for i in range(max((len(lst) for lst in lists), default=0)):
         for lst in lists:
             if i < len(lst):
                 s = lst[i]
-                if s.key in merged:
-                    merged[s.key].merge(s)
+                existing = next((index[k] for k in _dedup_keys(s) if k in index), None)
+                if existing is not None:
+                    existing.merge(s)
+                    s = existing
                 else:
-                    merged[s.key] = s
-                    order.append(s.key)
-    sources = [merged[k] for k in order][:max_sources]
+                    order.append(s)
+                for k in _dedup_keys(s):
+                    index.setdefault(k, s)
+    sources = order[:max_sources]
     return ScoutResult(sources, list(spec.search_queries), list(spec.analogy_queries), warnings)

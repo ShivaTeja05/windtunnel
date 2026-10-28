@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wind Tunnel</title>
+  <meta name="description" content="Test AI designs before you build them. Wind Tunnel finds methods in papers, turns them into candidate architectures, and races them on your examples with NVIDIA Nemotron.">
+  <meta name="theme-color" content="#0b1220">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2376b900'/><path d='M6 11h14M6 16h20M6 21h11' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+  <script>
+    try { const t = localStorage.getItem("wt-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/" data-link>
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--nv)"/><path d="M6 11h14M6 16h20M6 21h11" stroke="#fff" stroke-width="3" stroke-linecap="round"/></svg>
+        <span>Wind Tunnel</span>
+      </a>
+      <nav class="nav" id="nav">
+        <a href="/new" data-link>Run</a>
+        <a href="/explore" data-link>Explore</a>
+        <a href="/editor" data-link>Use in your editor</a>
+      </nav>
+      <div class="topbar-right">
+        <span id="mode-pill" class="pill pill-muted" title="Which engine this server is running">…</span>
+        <button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle dark mode">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+  <main id="app" class="container" aria-live="polite"></main>
+  <footer class="footer">
+    <div class="container footer-inner">
+      <span>Wind Tunnel · open source · NVIDIA Nemotron via <a href="https://tokenfactory.nebius.com" target="_blank" rel="noopener">Nebius Token Factory</a></span>
+      <span><a href="https://github.com/ShivaTeja05/windtunnel" target="_blank" rel="noopener">GitHub</a> · <a href="/api/docs">API</a></span>
+    </div>
+  </footer>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

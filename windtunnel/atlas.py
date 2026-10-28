@@ -22,6 +22,8 @@ def outcome_records(result: RaceResult, provenance: str) -> list[dict]:
     }
     records = []
     for r in result.results:
+        if not r.n:
+            continue  # never measured (every run hit an infrastructure error): no outcome to record
         lo, hi = r.accuracy_ci(result.config.confidence, result.config.seed)
         records.append(
             {
@@ -30,6 +32,7 @@ def outcome_records(result: RaceResult, provenance: str) -> list[dict]:
                 "task": task_record,
                 "design": {"id": r.design.id, "family": r.design.family, "model": r.design.model, "params": r.design.params},
                 "n": r.n,
+                "unmeasured": len(r.unmeasured),
                 "accuracy": r.accuracy,
                 "accuracy_ci": [lo, hi],
                 "cost_per_1k_usd": r.cost_per_1k,

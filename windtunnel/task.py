@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .scoring import validate_expected
+
 
 @dataclass(frozen=True)
 class Example:
@@ -39,11 +41,14 @@ def load_task(task_dir: str | Path) -> TaskSpec:
         if not line.strip():
             continue
         row = json.loads(line)
+        if row.get("expected") is None:
+            raise ValueError(f"{task_dir}/examples.jsonl line {lineno} has no expected answer")
         examples.append(Example(id=str(row.get("id", lineno)), input=row["input"], expected=str(row["expected"])))
     if not examples:
         raise ValueError(f"{task_dir}/examples.jsonl has no examples")
     if len({e.id for e in examples}) != len(examples):
         raise ValueError(f"{task_dir}/examples.jsonl has duplicate ids")
+    validate_expected(meta.get("scorer", "exact"), ((e.id, e.expected) for e in examples))
     return TaskSpec(
         name=meta["name"],
         description=meta["description"],

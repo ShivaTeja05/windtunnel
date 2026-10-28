@@ -48,6 +48,7 @@ class Edge:
     src: str
     dst: str
     label: str = ""
+    dashed: bool = False  # a conditional branch that only some inputs take
 
 
 @dataclass
@@ -115,6 +116,26 @@ def graph_for(design: Design) -> DesignGraph:
         g.nodes += [Node("synth", "llm", f"Combine findings · {m}", m), Node("out", "output", "Answer")]
         g.edges += [Edge("synth", "out")]
         return g
+    if design.family == "cascade":
+        cheap = p.get("cheap_model", "nano")
+        strong = p.get("escalate_model", "super")
+        n = int(p.get("samples", 2))
+        g = DesignGraph(design.id, f"Cascade {cheap} → {strong}")
+        g.nodes += [
+            Node("in", "input", "Input"),
+            Node("samples", "parallel", f"{n} cheap answers · {cheap}", cheap),
+            Node("agree", "check", "Answers agree?"),
+            Node("escalate", "llm", f"Escalate · {strong}", strong),
+            Node("out", "output", "Answer"),
+        ]
+        g.edges += [
+            Edge("in", "samples"),
+            Edge("samples", "agree", f"{n} answers"),
+            Edge("agree", "out", "agree"),
+            Edge("agree", "escalate", "disagree", dashed=True),
+            Edge("escalate", "out"),
+        ]
+        return g
     raise ValueError(f"no graph for family {design.family!r}")
 
 
@@ -129,7 +150,8 @@ def to_mermaid(graph: DesignGraph, direction: str = "LR") -> str:
         open_, close = SHAPES[n.kind]
         lines.append(f"  {n.id}{open_}{_label(n.label)}{close}")
     for e in graph.edges:
-        arrow = f" -->|{_label(e.label)}| " if e.label else " --> "
+        link = "-.->" if e.dashed else "-->"
+        arrow = f" {link}|{_label(e.label)}| " if e.label else f" {link} "
         lines.append(f"  {e.src}{arrow}{e.dst}")
     for tier, style in TIER_STYLES.items():
         lines.append(f"  classDef {tier} {style}")

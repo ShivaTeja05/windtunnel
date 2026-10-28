@@ -35,29 +35,49 @@ flowchart TB
   end
   L0 --> L1
   L1["L1 Understand · Nemotron Ultra<br/>problem → ProblemSpec"] --> L2
-  L2["L2 Scout · Nano + Tavily, arXiv, Semantic Scholar<br/>search plan → Sources"] --> L3
+  L2["L2 Scout · arXiv, OpenAlex, Semantic Scholar, Tavily<br/>search plan → Sources"] --> L3
   L3["L3 Extract · Nemotron Super<br/>source → MethodCard (citation verified)"] --> L4
   L4["L4 Design · Nemotron Ultra, isolated calls<br/>MethodCards → DesignSpec graphs"] --> L5
   L4 -.-> DIA[Architecture diagrams]
-  L5["L5 Race · Nano / Super / Ultra as test subjects<br/>designs × examples → measured outcomes"] --> L6
+  L5["L5 Race · Nano / Super / Ultra as test subjects<br/>designs × examples → measured outcomes"] --> L5B
+  L5B["L5b Diagnose + breed · Ultra diagnosis<br/>failures → mechanisms → bred designs"] --> L5
+  L5 --> L6
   L6["L6 Report<br/>verdict · plain-LLM comparison · model receipt · limitations · Atlas"]
   classDef ultra fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C
   classDef super fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
   classDef nano fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
-  class L1,L4 ultra
+  class L1,L4,L5B ultra
   class L3 super
-  class L2,L5 nano
+  class L5 nano
 ```
 
 | Layer | Model | Input → Output | Status |
 |---|---|---|---|
-| **L0 Interfaces** | none | user ↔ API | CLI done. Website and MCP next. |
-| **L1 Understand** | Ultra | problem text, constraints → `ProblemSpec` {requirements, constraints, success metric, problem types, search queries} | next |
-| **L2 Scout** | Nano (query expansion) | search queries → `Source[]` (title, authors, year, arXiv/DOI/URL, abstract), deduplicated. It deliberately includes recent papers, long-tail papers and papers from other fields. | next |
-| **L3 Extract** | Super | `Source` → `MethodCard` {mechanism, when it works, reported results and their conditions, limitations, code link, citation}. A citation is shown as verified only if its ID resolves. | next |
-| **L4 Design** | Ultra | `ProblemSpec` + `MethodCard[]` → `DesignSpec[]`. Each candidate comes from a separate call, has a different family, and links to the cards it drew on. Each compiles to a runnable pipeline **and** a `DesignGraph`. | graph + diagrams done; generator next |
-| **L5 Race** | Nano / Super / Ultra | designs × examples → accuracy ± CI, $/1k, p50 latency. Successive halving with paired bootstrap eliminates designs, and the verdict picks the cheapest design tied with the best. | done |
-| **L6 Report** | none | race + cards + advisor → verdict, "LLM would have picked", model receipt, limitations, Atlas records | partly done |
+| **L0 Interfaces** | none | user ↔ engine | Done. CLI (`windtunnel run` runs everything; `research`, `race`, `models` and `budget` run single stages), website (`uv run uvicorn windtunnel.api:app`) and MCP server ([docs/MCP.md](docs/MCP.md)). |
+| **L1 Understand** | Ultra | problem text, constraints → `ProblemSpec` {requirements, constraints, success metric, problem types, search queries, other-field analogy queries} | Done, with an offline keyword fallback. |
+| **L2 Scout** | none (search APIs) | search queries → `Source[]` (title, authors, year, arXiv/DOI/URL, abstract), deduplicated. Includes recent papers, long-tail papers and papers from other fields. Providers: arXiv, OpenAlex, Semantic Scholar, Tavily. | Done. |
+| **L3 Extract** | Super | `Source` → `MethodCard` {mechanism, when it works, when it breaks, reported results, citation}. The citation always comes from the search index, never from model text; it is shown as verified only if it has an arXiv ID or DOI. | Done, with an offline fallback per card. |
+| **L4 Design** | Ultra, isolated calls | `ProblemSpec` + `MethodCard[]` → candidate designs. One call per runnable family the research supports, plus a wildcard slot fed other-field and long-tail cards. Replies are validated strictly (tiers, clamped params, `based_on` limited to the cards given), near-duplicates are dropped, and a baseline (Nano single call) and the typical LLM default (Ultra crew) are always added. Each design compiles to a runnable pipeline **and** a `DesignGraph`. | Done. Offline mode maps research families to templates. |
+| **L5 Race** | Nano / Lightning / Super / Ultra as test subjects | designs × examples → accuracy ± CI, $/1k, p50 latency. Successive halving with a multiplicity-corrected exact sign test eliminates designs, and the verdict picks the cheapest design shown to be within a 0.05 accuracy margin of the best (others are inconclusive). Budget refusals and API outages are left unscored. Families: single call, self-check, self-consistency, plan-execute, orchestrator-workers and **cascade** (cheap answers, escalate on disagreement). | Done. |
+| **L5b Diagnose and breed** | Ultra (diagnosis) + rules | race → failure modes from a fixed taxonomy (offline evidence, merged with Ultra's reading of failure examples) → mechanisms from other fields (`mechanisms.json`, each with a source) applied as mutations → bred designs race the survivors. With enough examples a held-out split decides the final race. | Done. |
+| **L6 Report** | none | everything above → `windtunnel.engine.run_wind_tunnel` report: plain-LLM answer vs verdict, methods, candidates with Mermaid diagrams, leaderboard, bred designs and lineage, advisor pick, limitations computed from the run, model receipt, Atlas records | Done. Next: an Atlas prior that predicts the leaderboard from past outcomes. |
+
+### The engine
+
+`run_wind_tunnel(problem, task, client)` runs the stages in order and records each in
+the model receipt with who produced it (a model key, `offline-heuristic` or `mock`), its
+cost and its duration:
+
+```mermaid
+flowchart LR
+  P[plain_llm_answer] --> R[research<br/>L1-L3] --> D[design_candidates<br/>L4] --> X[race + breed<br/>L5] --> A[llm_pick<br/>advisor] --> L[limitations<br/>L6]
+```
+
+An optional `progress(stage, status)` callback lets the web app and MCP server show
+live stages. With no client, every model stage uses its offline fallback, the race runs
+on the mock client, and the report is labelled `mode: "offline"` and
+`provenance: "mock"`. A real client must be wrapped in `BudgetGuard` by the caller;
+the CLI is the only place that constructs one.
 
 ### Design rules
 - **Diagrams are generated from the same graph that runs.** They can't drift from what was tested.

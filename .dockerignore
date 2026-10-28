@@ -1,0 +1,16 @@
+.git
+.venv
+.env
+.env.*
+!.env.example
+.windtunnel
+.pytest_cache
+.claude
+**/__pycache__
+**/*.pyc
+runs
+atlas
+research
+tests
+docs
+integrations

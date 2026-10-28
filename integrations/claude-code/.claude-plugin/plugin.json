@@ -1,0 +1,9 @@
+{
+  "name": "windtunnel",
+  "version": "0.1.0",
+  "description": "Measure which AI architecture works for a feature before you build it: cited research, candidate designs, and a race on your own examples using NVIDIA Nemotron via Nebius Token Factory.",
+  "author": { "name": "Shiva Teja" },
+  "homepage": "https://github.com/ShivaTeja05/windtunnel",
+  "license": "MIT",
+  "keywords": ["mcp", "architecture", "evaluation", "nemotron", "nebius"]
+}

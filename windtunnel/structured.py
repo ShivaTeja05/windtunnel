@@ -9,26 +9,43 @@ from typing import Any
 from .llm import Completion, LLMClient
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_DECODER = json.JSONDecoder()
+
+
+class JSONReplyError(ValueError):
+    """No JSON in the reply even after a retry. `calls` holds the paid completions, so callers can count them."""
+
+    def __init__(self, message: str, calls: list[Completion]):
+        super().__init__(message)
+        self.calls = calls
 
 
 def extract_json(text: str) -> Any:
-    """Parse the first JSON object or array in a reply, tolerating code fences and chatter."""
+    """Parse the first JSON object or array in a reply, tolerating code fences and chatter.
+
+    Each '{' or '[' is tried in order with a streaming decode, so prose after the JSON
+    (even prose containing braces) cannot break it.
+    """
     candidates = [m.group(1) for m in _FENCE.finditer(text)] + [text]
     for candidate in candidates:
-        for opener, closer in (("{", "}"), ("[", "]")):
-            start, end = candidate.find(opener), candidate.rfind(closer)
-            if start != -1 and end > start:
-                try:
-                    return json.loads(candidate[start : end + 1])
-                except json.JSONDecodeError:
-                    continue
+        for i, ch in enumerate(candidate):
+            if ch not in "{[":
+                continue
+            try:
+                value, _ = _DECODER.raw_decode(candidate, i)
+            except json.JSONDecodeError:
+                continue
+            return value
     raise ValueError("no JSON found in model output")
 
 
 def ask_json(
     client: LLMClient, model: str, system: str, user: str, *, max_tokens: int = 2048
 ) -> tuple[Any, list[Completion]]:
-    """Ask for JSON; retry once with a stricter reminder if the first reply doesn't parse."""
+    """Ask for JSON; retry once with a stricter reminder if the first reply doesn't parse.
+
+    Raises JSONReplyError (a ValueError) carrying both paid calls when neither reply parses.
+    """
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     calls = []
     for attempt in range(2):
@@ -36,9 +53,9 @@ def ask_json(
         calls.append(completion)
         try:
             return extract_json(completion.text), calls
-        except ValueError:
+        except ValueError as exc:
             if attempt == 1:
-                raise
+                raise JSONReplyError(str(exc), calls) from None
             messages = [
                 *messages,
                 {"role": "assistant", "content": completion.text},

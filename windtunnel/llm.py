@@ -35,6 +35,44 @@ class LLMClient(Protocol):
     ) -> Completion: ...
 
 
+class Recorder:
+    """Wraps a client and keeps every completion, so spend is known even when a caller's parsing fails."""
+
+    def __init__(self, client: LLMClient):
+        self.client = client
+        self.calls: list[Completion] = []
+        self._lock = threading.Lock()
+
+    def complete(self, model: str, messages: list[dict], **kw) -> Completion:
+        completion = self.client.complete(model, messages, **kw)
+        with self._lock:
+            self.calls.append(completion)
+        return completion
+
+    @property
+    def cost_usd(self) -> float:
+        return sum(c.cost_usd for c in self.calls)
+
+    @property
+    def models(self) -> list[str]:
+        return list(dict.fromkeys(c.model for c in self.calls))
+
+
+def unwrap(client):
+    """The innermost client under wrappers such as BudgetGuard or Recorder (which keep it in `.client`)."""
+    for _ in range(5):
+        inner = getattr(client, "client", None)
+        if inner is None or not hasattr(inner, "complete"):
+            break
+        client = inner
+    return client
+
+
+def is_mock(client) -> bool:
+    """True for a MockClient, including one wrapped in BudgetGuard, Recorder or a counting wrapper."""
+    return client is not None and isinstance(unwrap(client), MockClient)
+
+
 class TokenFactoryClient:
     """OpenAI-compatible client for Nebius Token Factory, with backoff on rate limits."""
 

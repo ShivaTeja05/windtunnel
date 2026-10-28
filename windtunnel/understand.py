@@ -119,15 +119,21 @@ def understand_offline(problem: str) -> ProblemSpec:
 
 
 def _str_list(value) -> list[str]:
+    """A list of non-empty strings; anything that is not a string or a list (numbers, objects) gives []."""
     if isinstance(value, str):
         return [value] if value.strip() else []
-    return [str(v).strip() for v in value or [] if str(v).strip()]
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if isinstance(v, (str, int, float)) and str(v).strip()]
 
 
 def understand(problem: str, client: LLMClient | None = None, model: str = "ultra") -> ProblemSpec:
+    """Raises ValueError when the model's reply is not a usable plan, so callers can fall back offline."""
     if client is None:
         return understand_offline(problem)
     data, calls = ask_json(client, model, SYSTEM, PROMPT.format(problem=problem, types=PROBLEM_TYPES))
+    if not isinstance(data, dict):
+        raise ValueError(f"plan is a JSON {type(data).__name__}, not an object")
     types = [t for t in _str_list(data.get("problem_types")) if t in PROBLEM_TYPES] or ["other"]
     return ProblemSpec(
         problem=problem,

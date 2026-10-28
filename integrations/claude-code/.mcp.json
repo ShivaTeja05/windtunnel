@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "windtunnel": {
+      "command": "uvx",
+      "args": ["--from", "${WINDTUNNEL_SOURCE:-git+https://github.com/ShivaTeja05/windtunnel}", "windtunnel-mcp"],
+      "env": {
+        "NEBIUS_API_KEY": "${NEBIUS_API_KEY:-}",
+        "TAVILY_API_KEY": "${TAVILY_API_KEY:-}",
+        "WINDTUNNEL_BUDGET_USD": "${WINDTUNNEL_BUDGET_USD:-10}",
+        "WINDTUNNEL_HOME": "${CLAUDE_PLUGIN_DATA}"
+      }
+    }
+  }
+}

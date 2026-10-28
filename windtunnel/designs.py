@@ -23,6 +23,9 @@ ANSWER_RE = re.compile(r"^\s*ANSWER\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILI
 PLAN_MARKER = "Write a short numbered plan"
 SPLIT_MARKER = "one sub-question per line"
 WORKER_MARKER = "Sub-question:"
+# Extra task-specific guidance a design may carry (params["instructions"]) is capped so a
+# generated candidate cannot smuggle a whole prompt in.
+MAX_INSTRUCTIONS_CHARS = 600
 
 FAMILY_SUMMARIES = {
     "single_call": "one model call answers directly",
@@ -30,6 +33,7 @@ FAMILY_SUMMARIES = {
     "self_consistency": "sample several answers and take the majority vote",
     "plan_execute": "one call writes a plan, a second call follows it",
     "orchestrator_workers": "an orchestrator splits the input into sub-questions, workers answer them, the orchestrator combines",
+    "cascade": "a cheap model answers twice; if the answers agree return it, otherwise escalate to a stronger model",
 }
 
 
@@ -45,11 +49,24 @@ class Design:
         if self.family not in FAMILIES:
             raise ValueError(f"design {self.id!r}: unknown family {self.family!r}; known: {', '.join(FAMILIES)}")
         get_model(self.model)
-        if "worker_model" in self.params:
-            get_model(self.params["worker_model"])
+        for key in ("worker_model", "cheap_model", "escalate_model"):
+            if key in self.params:
+                get_model(self.params[key])  # KeyError naming the known models, as for `model`
+        instructions = self.params.get("instructions")
+        if instructions is not None and not isinstance(instructions, str):
+            raise ValueError(f"design {self.id!r}: instructions must be a string")
+        if self.family == "cascade" and int(self.params.get("samples", 2)) < 2:
+            raise ValueError(f"design {self.id!r}: cascade needs samples >= 2 to check agreement")
+
+    @property
+    def instructions(self) -> str:
+        """Extra guidance for answering calls, trimmed and capped ("" when absent)."""
+        return (self.params.get("instructions") or "").strip()[:MAX_INSTRUCTIONS_CHARS]
 
     def describe(self) -> str:
-        extras = ", ".join(f"{k}={v}" for k, v in self.params.items())
+        extras = ", ".join(f"{k}={v}" for k, v in self.params.items() if k != "instructions")
+        if self.instructions:
+            extras += (", " if extras else "") + "custom instructions"
         return f"{FAMILY_SUMMARIES[self.family]} (model: {self.model}{', ' + extras if extras else ''})"
 
 
@@ -59,6 +76,9 @@ class Trace:
     calls: list[Completion]
     latency_s: float
     error: str | None = None
+    # None for a model-side failure; "budget" or "provider" when the infrastructure failed,
+    # in which case the example says nothing about the design and must not be scored.
+    infra: str | None = None
 
     @property
     def cost_usd(self) -> float:
@@ -73,9 +93,10 @@ def extract_answer(text: str) -> str:
     return lines[-1] if lines else ""
 
 
-def _system(task: TaskSpec) -> str:
+def _system(task: TaskSpec, design: Design | None = None) -> str:
+    extra = f"Guidance: {design.instructions}\n" if design is not None and design.instructions else ""
     return (
-        f"Task: {task.description}\n{task.output_instructions}\n"
+        f"Task: {task.description}\n{task.output_instructions}\n{extra}"
         "Finish with a final line in exactly this form: ANSWER: <your answer>"
     )
 
@@ -92,17 +113,17 @@ Family = Callable[[Design, TaskSpec, str, LLMClient, list[Completion]], tuple[st
 
 
 def _single_call(d: Design, task: TaskSpec, x: str, client: LLMClient, calls: list[Completion]) -> tuple[str, float]:
-    c = _ask(client, calls, d.model, _system(task), f"Input:\n{x}")
+    c = _ask(client, calls, d.model, _system(task, d), f"Input:\n{x}")
     return extract_answer(c.text), c.latency_s
 
 
 def _self_check(d: Design, task: TaskSpec, x: str, client: LLMClient, calls: list[Completion]) -> tuple[str, float]:
-    first = _ask(client, calls, d.model, _system(task), f"Input:\n{x}")
+    first = _ask(client, calls, d.model, _system(task, d), f"Input:\n{x}")
     check = _ask(
         client,
         calls,
         d.model,
-        _system(task),
+        _system(task, d),
         f"Input:\n{x}\n\nA first attempt answered: {extract_answer(first.text)}\n"
         "Check this answer carefully against the task. If it is wrong, correct it.",
     )
@@ -112,7 +133,7 @@ def _self_check(d: Design, task: TaskSpec, x: str, client: LLMClient, calls: lis
 def _self_consistency(d: Design, task: TaskSpec, x: str, client: LLMClient, calls: list[Completion]) -> tuple[str, float]:
     n = int(d.params.get("n", 5))
     temperature = float(d.params.get("temperature", 0.7))
-    samples = [_ask(client, calls, d.model, _system(task), f"Input:\n{x}", temperature=temperature) for _ in range(n)]
+    samples = [_ask(client, calls, d.model, _system(task, d), f"Input:\n{x}", temperature=temperature) for _ in range(n)]
     answers = [extract_answer(s.text) for s in samples]
     votes = Counter(normalize(a) for a in answers)
     top = votes.most_common(1)[0][0]
@@ -127,7 +148,7 @@ def _plan_execute(d: Design, task: TaskSpec, x: str, client: LLMClient, calls: l
         f"Task: {task.description}\n{PLAN_MARKER} (at most 5 steps) for solving the input. Do not give the final answer.",
         f"Input:\n{x}",
     )
-    run = _ask(client, calls, d.model, _system(task), f"Input:\n{x}\n\nPlan:\n{plan.text}\n\nFollow the plan.")
+    run = _ask(client, calls, d.model, _system(task, d), f"Input:\n{x}\n\nPlan:\n{plan.text}\n\nFollow the plan.")
     return extract_answer(run.text), plan.latency_s + run.latency_s
 
 
@@ -149,14 +170,30 @@ def _orchestrator_workers(d: Design, task: TaskSpec, x: str, client: LLMClient, 
             client,
             calls,
             worker_model,
-            f"Task context: {task.description}\nAnswer the sub-question concisely using the input.",
+            f"Task context: {task.description}\n"
+            + (f"Guidance: {d.instructions}\n" if d.instructions else "")
+            + "Answer the sub-question concisely using the input.",
             f"Input:\n{x}\n\n{WORKER_MARKER} {q}",
         )
         for q in subqs
     ]
     findings = "\n".join(f"- {q}: {w.text.strip()}" for q, w in zip(subqs, workers))
-    synth = _ask(client, calls, d.model, _system(task), f"Input:\n{x}\n\nFindings from helpers:\n{findings}")
+    synth = _ask(client, calls, d.model, _system(task, d), f"Input:\n{x}\n\nFindings from helpers:\n{findings}")
     return extract_answer(synth.text), split.latency_s + max(w.latency_s for w in workers) + synth.latency_s
+
+
+def _cascade(d: Design, task: TaskSpec, x: str, client: LLMClient, calls: list[Completion]) -> tuple[str, float]:
+    cheap = d.params.get("cheap_model", "nano")
+    n = int(d.params.get("samples", 2))
+    temperature = float(d.params.get("temperature", 0.7))
+    samples = [_ask(client, calls, cheap, _system(task, d), f"Input:\n{x}", temperature=temperature) for _ in range(n)]
+    answers = [extract_answer(s.text) for s in samples]
+    latency = max(s.latency_s for s in samples)
+    if answers[0] and len({normalize(a) for a in answers}) == 1:
+        return answers[0], latency
+    # Disagreement (or an empty answer) means the cheap model is unsure: one call to the stronger model decides.
+    escalated = _ask(client, calls, d.params.get("escalate_model", "super"), _system(task, d), f"Input:\n{x}")
+    return extract_answer(escalated.text), latency + escalated.latency_s
 
 
 FAMILIES: dict[str, Family] = {
@@ -165,15 +202,32 @@ FAMILIES: dict[str, Family] = {
     "self_consistency": _self_consistency,
     "plan_execute": _plan_execute,
     "orchestrator_workers": _orchestrator_workers,
+    "cascade": _cascade,
 }
+
+
+# Transport failures left after the client's own retries (openai's exception names, so
+# this module need not import openai).
+_PROVIDER_ERRORS = {"RateLimitError", "APIConnectionError", "APITimeoutError", "InternalServerError"}
+
+
+def infra_kind(exc: BaseException) -> str | None:
+    """"budget" for a spending-cap refusal, "provider" for an API outage, None for a model-side failure."""
+    from .budget import BudgetExceeded
+
+    if isinstance(exc, BudgetExceeded):
+        return "budget"
+    if isinstance(exc, (TimeoutError, ConnectionError)) or any(c.__name__ in _PROVIDER_ERRORS for c in type(exc).__mro__):
+        return "provider"
+    return None
 
 
 def run_design(design: Design, task: TaskSpec, x: str, client: LLMClient) -> Trace:
     calls: list[Completion] = []
     try:
         output, latency = FAMILIES[design.family](design, task, x, client, calls)
-    except Exception as exc:  # a failed pipeline scores 0 but keeps the calls it already paid for
-        return Trace("", calls, sum(c.latency_s for c in calls), error=f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # recorded with the calls it already paid for; the racer decides how to score it
+        return Trace("", calls, sum(c.latency_s for c in calls), error=f"{type(exc).__name__}: {exc}", infra=infra_kind(exc))
     return Trace(output, calls, latency)
 
 
@@ -187,6 +241,13 @@ def default_designs() -> list[Design]:
         Design("vote5-nano", "self_consistency", "nano", {"n": 5, "temperature": 0.7}),
         Design("plan-super", "plan_execute", "super"),
         Design("crew-ultra", "orchestrator_workers", "ultra", {"worker_model": "super", "max_subtasks": 3}),
+        Design(
+            "cascade-nano-super",
+            "cascade",
+            "nano",
+            {"cheap_model": "nano", "samples": 2, "temperature": 0.7, "escalate_model": "super"},
+            rationale="Pay for Super only on inputs where Nano disagrees with itself.",
+        ),
     ]
 
 
