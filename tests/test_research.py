@@ -121,7 +121,7 @@ def test_understand_rejects_or_cleans_wrong_shaped_plans():
     spec = understand("classify tickets", ScriptedClient(['{"summary": "x", "requirements": 3, "search_queries": {"a": 1}}']))
     assert spec.requirements == [] and spec.search_queries  # fell back to the offline queries
     with pytest.raises(ValueError):
-        understand("classify tickets", ScriptedClient(['["not", "a", "plan"]']))
+        understand("classify tickets", ScriptedClient(['["not", "a", "plan"]', '["still", "not"]']))  # retried once
 
 
 def test_scout_merges_arxiv_and_doi_records_of_one_paper():

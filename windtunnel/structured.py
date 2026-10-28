@@ -20,11 +20,12 @@ class JSONReplyError(ValueError):
         self.calls = calls
 
 
-def extract_json(text: str) -> Any:
+def extract_json(text: str, expect: type | tuple[type, ...] | None = None) -> Any:
     """Parse the first JSON object or array in a reply, tolerating code fences and chatter.
 
     Each '{' or '[' is tried in order with a streaming decode, so prose after the JSON
-    (even prose containing braces) cannot break it.
+    (even prose containing braces) cannot break it. With `expect`, values of other types
+    are skipped, so a citation marker such as "[1]" is never taken for the reply.
     """
     candidates = [m.group(1) for m in _FENCE.finditer(text)] + [text]
     for candidate in candidates:
@@ -35,12 +36,19 @@ def extract_json(text: str) -> Any:
                 value, _ = _DECODER.raw_decode(candidate, i)
             except json.JSONDecodeError:
                 continue
-            return value
+            if expect is None or isinstance(value, expect):
+                return value
     raise ValueError("no JSON found in model output")
 
 
 def ask_json(
-    client: LLMClient, model: str, system: str, user: str, *, max_tokens: int = 2048
+    client: LLMClient,
+    model: str,
+    system: str,
+    user: str,
+    *,
+    max_tokens: int = 2048,
+    expect: type | tuple[type, ...] = dict,
 ) -> tuple[Any, list[Completion]]:
     """Ask for JSON; retry once with a stricter reminder if the first reply doesn't parse.
 
@@ -52,7 +60,7 @@ def ask_json(
         completion = client.complete(model, messages, max_tokens=max_tokens)
         calls.append(completion)
         try:
-            return extract_json(completion.text), calls
+            return extract_json(completion.text, expect), calls
         except ValueError as exc:
             if attempt == 1:
                 raise JSONReplyError(str(exc), calls) from None

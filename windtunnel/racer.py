@@ -277,7 +277,8 @@ def _decide(
         if any(r.alive for r in results):
             return None, None, [], [], "No design could be measured: every run failed for infrastructure reasons."
         return None, None, [], [], "No design met the task's constraints."
-    best = max(survivors, key=lambda r: r.accuracy)
+    # Equal accuracy goes to the cheaper design, never to whichever was listed first.
+    best = max(survivors, key=lambda r: (r.accuracy, -r.cost_per_1k))
     alpha = 1 - cfg.confidence
     tied, inconclusive = [best], []
     close: dict[str, Comparison] = {}

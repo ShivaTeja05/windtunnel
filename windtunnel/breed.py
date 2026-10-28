@@ -249,7 +249,7 @@ def _ask_model(diag: Diagnosis, r: DesignResult, task: TaskSpec, client: LLMClie
     label = _model_label(client, model)
     recorder = Recorder(client)
     try:
-        data, _ = ask_json(recorder, model, DIAGNOSE_SYSTEM, prompt, max_tokens=800)
+        data, _ = ask_json(recorder, model, DIAGNOSE_SYSTEM, prompt, max_tokens=800, expect=(dict, list))
     except ValueError:
         diag.produced_by = f"{OFFLINE} ({label} reply was not valid JSON)"
         return

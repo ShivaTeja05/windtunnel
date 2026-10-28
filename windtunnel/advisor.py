@@ -7,7 +7,7 @@ from .designs import Design
 from .llm import LLMClient
 from .task import TaskSpec
 
-PICK_RE = re.compile(r"^\s*PICK\s*:\s*([\w.-]+)", re.IGNORECASE | re.MULTILINE)
+PICK_RE = re.compile(r"^[\s*_`>#]*PICK[\s*_`]*:[\s*_`]*([\w.+-]+)", re.IGNORECASE | re.MULTILINE)
 
 
 @dataclass(frozen=True)

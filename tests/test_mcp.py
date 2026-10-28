@@ -448,7 +448,8 @@ def test_research_fallback_is_not_cached_and_its_spend_is_counted():
     first = server._research(PROBLEM, 5, client)
     assert first.mode == "offline" and first.cost_usd > 0  # the rejected plan was paid for
     second = server._research(PROBLEM, 5, client)
-    assert second is not first and client.calls == 2  # Nemotron is tried again, not the stale fallback
+    # Each attempt is the plan call plus one JSON retry; Nemotron is tried again, not the stale fallback.
+    assert second is not first and client.calls == 4
     labels, note = server._research_labels(first, client)
     assert labels == ["OFFLINE"] and note == server.MODE_NOTES["fallback"]
 

@@ -18,7 +18,9 @@ from .models import get_model
 from .scoring import normalize
 from .task import TaskSpec
 
-ANSWER_RE = re.compile(r"^\s*ANSWER\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+# Tolerates markdown around the marker, e.g. "**ANSWER:** billing" or "> ANSWER: `billing`".
+# Trailing markers exclude "#" and "_" so answers such as "C#" or "snake_case_" survive.
+ANSWER_RE = re.compile(r"^[\s*_`>#]*ANSWER[\s*_`]*:[\s*_`]*(.+?)[\s*`]*$", re.IGNORECASE | re.MULTILINE)
 # Phrases the mock client keys on to recognise each pipeline step.
 PLAN_MARKER = "Write a short numbered plan"
 SPLIT_MARKER = "one sub-question per line"
@@ -88,9 +90,13 @@ class Trace:
 def extract_answer(text: str) -> str:
     matches = ANSWER_RE.findall(text)
     if matches:
-        return matches[-1].strip()
+        return _strip_markdown(matches[-1])
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+    return _strip_markdown(lines[-1]) if lines else ""
+
+
+def _strip_markdown(answer: str) -> str:
+    return answer.strip().strip("*`").strip()
 
 
 def _system(task: TaskSpec, design: Design | None = None) -> str:
@@ -208,7 +214,16 @@ FAMILIES: dict[str, Family] = {
 
 # Transport failures left after the client's own retries (openai's exception names, so
 # this module need not import openai).
-_PROVIDER_ERRORS = {"RateLimitError", "APIConnectionError", "APITimeoutError", "InternalServerError"}
+# A missing model or a rejected key is the provider's failure too, never a wrong answer.
+_PROVIDER_ERRORS = {
+    "RateLimitError",
+    "APIConnectionError",
+    "APITimeoutError",
+    "InternalServerError",
+    "NotFoundError",
+    "AuthenticationError",
+    "PermissionDeniedError",
+}
 
 
 def infra_kind(exc: BaseException) -> str | None:
