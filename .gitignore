@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+runs/
+atlas/outcomes.jsonl
+.windtunnel/
+
+# Private team notes (kept local)
+research/

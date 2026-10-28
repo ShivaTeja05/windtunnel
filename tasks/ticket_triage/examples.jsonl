@@ -1,0 +1,40 @@
+{"id": "t01", "input": "I was charged twice for order #4821 this morning. Please fix this.", "expected": "billing"}
+{"id": "t02", "input": "Why does my invoice show a $14.99 'service fee' I never agreed to?", "expected": "billing"}
+{"id": "t03", "input": "My card was declined at checkout but the money still left my account.", "expected": "billing"}
+{"id": "t04", "input": "Can I get a VAT invoice with my company name on it for my last purchase?", "expected": "billing"}
+{"id": "t05", "input": "You billed my old credit card even though I updated it last week.", "expected": "billing"}
+{"id": "t06", "input": "The price at checkout was higher than the price on the product page.", "expected": "billing"}
+{"id": "t07", "input": "I need to change the billing address on my subscription invoices.", "expected": "billing"}
+{"id": "t08", "input": "I see a pending charge from you but I never placed an order.", "expected": "billing"}
+{"id": "t09", "input": "The app crashes every time I open the order history screen on Android.", "expected": "bug"}
+{"id": "t10", "input": "Clicking 'Apply coupon' does nothing, the page just spins forever.", "expected": "bug"}
+{"id": "t11", "input": "Product images aren't loading on your website in Firefox.", "expected": "bug"}
+{"id": "t12", "input": "Search returns laptops when I type 'headphones'. Something is broken.", "expected": "bug"}
+{"id": "t13", "input": "The checkout button is greyed out even though my cart has items.", "expected": "bug"}
+{"id": "t14", "input": "Your iOS app shows the wrong currency after the latest update.", "expected": "bug"}
+{"id": "t15", "input": "When I switch to dark mode the text on the cart page becomes invisible.", "expected": "bug"}
+{"id": "t16", "input": "The size filter on the TV category page shows zero results for every option.", "expected": "bug"}
+{"id": "t17", "input": "I can't log in, it says my password is wrong but I just reset it.", "expected": "account_access"}
+{"id": "t18", "input": "I never received the two-factor code by SMS so I'm locked out.", "expected": "account_access"}
+{"id": "t19", "input": "My account got locked after too many attempts, how do I unlock it?", "expected": "account_access"}
+{"id": "t20", "input": "I want to change the email address I use to sign in.", "expected": "account_access"}
+{"id": "t21", "input": "Someone else seems to have logged into my account from another country.", "expected": "account_access"}
+{"id": "t22", "input": "The password reset link in your email says it has expired.", "expected": "account_access"}
+{"id": "t23", "input": "I lost access to my old phone number and can't verify my identity to sign in.", "expected": "account_access"}
+{"id": "t24", "input": "How do I sign in with Google instead of a password?", "expected": "account_access"}
+{"id": "t25", "input": "My package has said 'out for delivery' for three days.", "expected": "shipping"}
+{"id": "t26", "input": "The tracking number you sent me doesn't work on the courier's site.", "expected": "shipping"}
+{"id": "t27", "input": "Do you ship to Iceland, and how long does it take?", "expected": "shipping"}
+{"id": "t28", "input": "The courier left my parcel at the wrong address.", "expected": "shipping"}
+{"id": "t29", "input": "My order arrived but the box was crushed and the monitor is cracked.", "expected": "shipping"}
+{"id": "t30", "input": "Can I change the delivery address for an order that has already shipped?", "expected": "shipping"}
+{"id": "t31", "input": "It's been two weeks and my order still hasn't been dispatched.", "expected": "shipping"}
+{"id": "t32", "input": "Can I pick up my order from a store instead of having it delivered?", "expected": "shipping"}
+{"id": "t33", "input": "It would be great if I could save several shipping addresses in my profile.", "expected": "feature_request"}
+{"id": "t34", "input": "Please add a way to compare three laptops side by side.", "expected": "feature_request"}
+{"id": "t35", "input": "Could you let us pay in monthly instalments?", "expected": "feature_request"}
+{"id": "t36", "input": "I'd love a dark mode for the website, not just the app.", "expected": "feature_request"}
+{"id": "t37", "input": "Please add price-drop alerts for items on my wishlist.", "expected": "feature_request"}
+{"id": "t38", "input": "Could the app support Apple Watch notifications for delivery updates?", "expected": "feature_request"}
+{"id": "t39", "input": "Can you add a filter for refurbished products only?", "expected": "feature_request"}
+{"id": "t40", "input": "It would help if order confirmation emails included the warranty details.", "expected": "feature_request"}

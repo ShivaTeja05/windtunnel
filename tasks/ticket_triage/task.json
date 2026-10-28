@@ -1,0 +1,9 @@
+{
+  "name": "ticket_triage",
+  "description": "Route a customer-support ticket for an online electronics store to exactly one queue: billing, bug, account_access, shipping, or feature_request.",
+  "output_instructions": "Answer with the queue name only, exactly as written above.",
+  "scorer": "exact",
+  "labels": ["billing", "bug", "account_access", "shipping", "feature_request"],
+  "constraints": {"max_cost_per_1k": 5.0, "max_p50_latency_s": 15.0},
+  "provenance": "Hand-written development fixture (40 tickets, 8 per queue, a few deliberately tricky). Replace with real labelled data before quoting any numbers."
+}

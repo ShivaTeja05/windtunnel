@@ -1,0 +1,82 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Design diagrams</title>
+<style>body{font-family:system-ui;background:#fff;margin:24px} section{border:1px solid #ddd;border-radius:10px;padding:12px 16px;margin:12px 0} h2{font-size:16px}</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script></head>
+<body><h1>Wind Tunnel: generated architecture diagrams</h1><section><h2>Answer + self-check <code>selfcheck-nano</code></h2><pre class="mermaid">flowchart LR
+  in([&quot;Input&quot;])
+  answer[&quot;Draft answer · nano&quot;]
+  check{{&quot;Check &amp; correct · nano&quot;}}
+  out([&quot;Answer&quot;])
+  in --&gt; answer
+  answer --&gt; check
+  check --&gt; out
+  classDef nano fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+  classDef lightning fill:#E0F7FA,stroke:#00838F,color:#006064
+  classDef super fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
+  classDef ultra fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C
+  classDef io fill:#F5F5F5,stroke:#616161,color:#212121
+  class in io
+  class answer nano
+  class check nano
+  class out io</pre></section>
+<section><h2>Self-consistency ×5 <code>vote5-nano</code></h2><pre class="mermaid">flowchart LR
+  in([&quot;Input&quot;])
+  samples[[&quot;5 independent answers · nano&quot;]]
+  vote[/&quot;Majority vote&quot;\]
+  out([&quot;Answer&quot;])
+  in --&gt; samples
+  samples --&gt;|&quot;5 answers&quot;| vote
+  vote --&gt; out
+  classDef nano fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+  classDef lightning fill:#E0F7FA,stroke:#00838F,color:#006064
+  classDef super fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
+  classDef ultra fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C
+  classDef io fill:#F5F5F5,stroke:#616161,color:#212121
+  class in io
+  class samples nano
+  class vote io
+  class out io</pre></section>
+<section><h2>Plan, then execute <code>plan-super</code></h2><pre class="mermaid">flowchart LR
+  in([&quot;Input&quot;])
+  plan[&quot;Write plan · super&quot;]
+  exec[&quot;Follow plan · super&quot;]
+  out([&quot;Answer&quot;])
+  in --&gt; plan
+  plan --&gt; exec
+  exec --&gt; out
+  classDef nano fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+  classDef lightning fill:#E0F7FA,stroke:#00838F,color:#006064
+  classDef super fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
+  classDef ultra fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C
+  classDef io fill:#F5F5F5,stroke:#616161,color:#212121
+  class in io
+  class plan super
+  class exec super
+  class out io</pre></section>
+<section><h2>Orchestrator + workers <code>crew-ultra</code></h2><pre class="mermaid">flowchart LR
+  in([&quot;Input&quot;])
+  split[&quot;Split into ≤3 sub-questions · ultra&quot;]
+  w1[&quot;Worker 1 · super&quot;]
+  w2[&quot;Worker 2 · super&quot;]
+  w3[&quot;Worker 3 · super&quot;]
+  synth[&quot;Combine findings · ultra&quot;]
+  out([&quot;Answer&quot;])
+  in --&gt; split
+  split --&gt; w1
+  w1 --&gt; synth
+  split --&gt; w2
+  w2 --&gt; synth
+  split --&gt; w3
+  w3 --&gt; synth
+  synth --&gt; out
+  classDef nano fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+  classDef lightning fill:#E0F7FA,stroke:#00838F,color:#006064
+  classDef super fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
+  classDef ultra fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C
+  classDef io fill:#F5F5F5,stroke:#616161,color:#212121
+  class in io
+  class split ultra
+  class w1 super
+  class w2 super
+  class w3 super
+  class synth ultra
+  class out io</pre></section><script>mermaid.initialize({startOnLoad:true, theme:'base', flowchart:{curve:'basis'}});</script></body></html>
