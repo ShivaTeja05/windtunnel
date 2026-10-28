@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .advisor import AdvisorPick, llm_pick
 from .atlas import outcome_records
-from .baseline import plain_llm_answer
+from .baseline import PlainAnswer, plain_llm_answer
 from .breed import BreedingResult, race_with_breeding
 from .budget import BudgetExceeded
 from .generate import CandidateDesign, design_candidates
@@ -94,7 +94,8 @@ def _measured(r: DesignResult, result: RaceResult, role: str) -> dict:
         "model": r.design.model,
         "accuracy": finite(r.accuracy),
         "accuracy_ci": [finite(lo), finite(hi)],
-        "cost_per_1k_usd": r.cost_per_1k,
+        # A design with no measured runs has no cost per request, not a cost of $0.
+        "cost_per_1k_usd": r.cost_per_1k if r.n else None,
         "p50_latency_s": finite(r.p50_latency_s),
         "n": r.n,
         "unmeasured": len(r.unmeasured),
@@ -109,15 +110,37 @@ def _strip_outputs(d: dict) -> dict:
     return {**d, "designs": [{k: v for k, v in row.items() if k != "outputs"} for row in d["designs"]]}
 
 
-def append_to_atlas(races: list[RaceResult], provenance: str, path: str | Path) -> int:
-    """Log each design once: every candidate from the first race, then designs first seen in later races (bred ones)."""
+def append_to_atlas(
+    races: list[RaceResult],
+    provenance: str,
+    path: str | Path,
+    roles: list[str] | None = None,
+    breeding: BreedingResult | None = None,
+) -> int:
+    """Log each design once: every candidate from the first race, then designs first seen in later races (bred ones).
+
+    Each record says which race it came from (`race_role`), whether the design was bred, and
+    whether its score is selection-biased: a bred design scored on the examples it was bred from
+    is optimistic, unlike one scored on the held-out split.
+    """
+    roles = roles or ["initial"] * len(races)
+    lineage = breeding.lineage if breeding is not None else {}
+    held = set(breeding.holdout_ids) if breeding is not None else set()
     seen: set[str] = set()
     records = []
-    for result in races:
+    for result, role in zip(races, roles):
+        on_holdout = bool(held) and {e.id for e in result.task.examples} == held
         # A race the spending cap stopped is labelled so it is never read back as a measured outcome.
         for record in outcome_records(result, f"{provenance}-incomplete" if result.aborted else provenance):
-            if record["design"]["id"] not in seen:
-                seen.add(record["design"]["id"])
+            design_id = record["design"]["id"]
+            if design_id not in seen:
+                seen.add(design_id)
+                bred = design_id in lineage
+                record["race_role"] = role
+                record["origin"] = "bred" if bred else "candidate"
+                record["selection_biased"] = bred and not on_holdout
+                if bred:
+                    record["lineage"] = lineage[design_id]
                 records.append(record)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,7 +248,7 @@ def build_limitations(
         )
         unverified = sum(not c.verified for c in cards)
         if unverified:
-            out.append(f"{unverified} of {len(cards)} sources have no resolvable arXiv ID or DOI (web pages or unindexed); treat them as leads.")
+            out.append(f"{unverified} of {len(cards)} sources have no arXiv ID or DOI from a scholarly index (web pages or unindexed); treat them as leads.")
         if mode == "nemotron":
             fallback = sum(c.extracted_by == OFFLINE for c in cards)
             if fallback:
@@ -307,7 +330,7 @@ def build_limitations(
                 f"so these designs were measured on fewer examples: {', '.join(unmeasured)}."
             )
         if breeding is not None:
-            if breeding.bred and not breeding.holdout_ids:
+            if breeding.bred and not breeding.final_on_holdout:
                 out.append(
                     f"Bred designs ({', '.join(b.design.id for b in breeding.bred)}) were chosen from failures on the same "
                     "examples they were raced on, so their scores are optimistic until confirmed on held-out data."
@@ -380,18 +403,23 @@ def run_wind_tunnel(
     generations: int = 1,
     breed_per_generation: int = 3,
     atlas_path: str | Path | None = None,
+    research_result: ResearchResult | None = None,
+    candidates: list[CandidateDesign] | None = None,
 ) -> dict:
     """Run every stage and return the report dict.
 
     `client` must already be wrapped in BudgetGuard if it is real. None (or a MockClient)
     means offline: heuristics for the model stages and a mock race labelled "mock".
     With `atlas_path`, raced designs are appended to the Outcome Atlas with their provenance.
+    `research_result` and `candidates` reuse research and designs made earlier for the same
+    problem (e.g. the MCP server's design_candidates), so the raced set is the one shown and
+    is not paid for twice; the receipt says they were reused.
     """
     stages = _Stages(progress)
     try:
         return _run(
             problem, task, client, stages, providers, fetcher, breed, config, max_sources, max_designs, generations,
-            breed_per_generation, atlas_path,
+            breed_per_generation, atlas_path, research_result, candidates,
         )
     except BaseException:
         stages.failed()
@@ -400,7 +428,7 @@ def run_wind_tunnel(
 
 def _run(
     problem, task, client, stages, providers, fetcher, breed, config, max_sources, max_designs, generations,
-    breed_per_generation, atlas_path,
+    breed_per_generation, atlas_path, research_result, precomputed,
 ) -> dict:
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     cfg = config or RaceConfig()
@@ -418,7 +446,8 @@ def _run(
     try:
         plain = plain_llm_answer(problem, model_client)
     except BudgetExceeded:
-        plain = plain_llm_answer(problem, None)
+        # Not the offline text: a key is set, the cap is what stopped it.
+        plain = PlainAnswer(False, "The spending cap was reached before the plain-LLM answer, so there is none.", "ultra")
         infra_notes.append("The spending cap was reached before the plain-LLM answer, so it was not produced.")
     if plain.available:
         stages.done(plain.model, plain.cost_usd, detail="no search, no tests")
@@ -429,35 +458,43 @@ def _run(
     stages.start("research")
     recorder = Recorder(model_client) if model_client is not None else None
     rejected = ""
-    try:
-        found = research(problem, recorder, providers=providers, max_sources=max_sources, fetcher=fetcher)
-    except (ValueError, TypeError, AttributeError, KeyError, BudgetExceeded) as exc:  # Ultra's plan was unusable
-        warnings.append(
-            f"research plan from Nemotron was unusable ({type(exc).__name__}: {exc}); fell back to the offline heuristic"
-        )
-        found = research(problem, None, providers=providers, max_sources=max_sources, fetcher=fetcher)
-        found.spec.cost_usd = recorder.cost_usd  # paid for, even though unusable
-        rejected = "+".join(f"{m}(rejected)" for m in recorder.models)
+    reused = research_result is not None
+    if reused:
+        found = research_result
+    else:
+        try:
+            found = research(problem, recorder, providers=providers, max_sources=max_sources, fetcher=fetcher)
+        except (ValueError, TypeError, AttributeError, KeyError, BudgetExceeded) as exc:  # Ultra's plan was unusable
+            warnings.append(
+                f"research plan from Nemotron was unusable ({type(exc).__name__}: {exc}); fell back to the offline heuristic"
+            )
+            found = research(problem, None, providers=providers, max_sources=max_sources, fetcher=fetcher)
+            found.spec.cost_usd = recorder.cost_usd  # paid for, even though unusable
+            rejected = "+".join(f"{m}(rejected)" for m in recorder.models)
     warnings += found.warnings
     verified = sum(c.verified for c in found.cards)
     stages.done(
         _join([rejected, found.spec.produced_by, *(c.extracted_by for c in found.cards)]),
-        recorder.cost_usd if recorder is not None else found.cost_usd,
-        detail=f"{len(found.scout.sources)} sources, {len(found.cards)} method cards, {verified} with verified IDs",
+        0.0 if reused else recorder.cost_usd if recorder is not None else found.cost_usd,
+        detail=f"{len(found.scout.sources)} sources, {len(found.cards)} method cards, {verified} with verified IDs"
+        + (f"; reused from an earlier call that spent ${found.cost_usd:.4f}" if reused else ""),
     )
 
     # L4: candidate designs, each with the graph its diagram is drawn from.
     stages.start("design_candidates")
     design_warnings: list[str] = []
-    # Metered here too: a dropped wildcard slot or near-duplicate was still paid for.
-    recorder = Recorder(model_client) if model_client is not None else None
-    candidates = design_candidates(found.spec, found.cards, recorder, max_designs=max_designs, warnings=design_warnings)
+    if precomputed is not None:
+        candidates = list(precomputed)
+        design_cost = 0.0
+        design_detail = f"{len(candidates)} candidates, reused from an earlier call that spent ${sum(c.cost_usd for c in candidates):.4f}"
+    else:
+        # Metered here too: a dropped wildcard slot or near-duplicate was still paid for.
+        recorder = Recorder(model_client) if model_client is not None else None
+        candidates = design_candidates(found.spec, found.cards, recorder, max_designs=max_designs, warnings=design_warnings)
+        design_cost = recorder.cost_usd if recorder is not None else 0.0
+        design_detail = f"{len(candidates)} candidates"
     warnings += design_warnings
-    stages.done(
-        _join(c.generated_by for c in candidates),
-        recorder.cost_usd if recorder is not None else 0.0,
-        detail=f"{len(candidates)} candidates",
-    )
+    stages.done(_join(c.generated_by for c in candidates), design_cost, detail=design_detail)
 
     # L5: the race, with diagnose-and-breed.
     races: list[RaceResult] = []
@@ -568,7 +605,10 @@ def _run(
         breeding_d = {
             "enabled": True,
             "note": breeding.note,
-            "selection_bias": "controlled by a held-out split" if breeding.holdout_ids else "present: bred designs' scores are optimistic",
+            "selection_bias": "controlled by a held-out split"
+            if breeding.final_on_holdout
+            else "present: bred designs' scores are optimistic",
+            "final_on_holdout": breeding.final_on_holdout,
             "bred": bred,
             "lineage": breeding.lineage,
             "diagnoses": [[d.to_dict() for d in gen] for gen in breeding.diagnoses],
@@ -601,7 +641,7 @@ def _run(
 
     atlas_d = None
     if atlas_path and races:
-        atlas_d = {"path": str(atlas_path), "records": append_to_atlas(races, provenance, atlas_path), "provenance": provenance}
+        atlas_d = {"path": str(atlas_path), "records": append_to_atlas(races, provenance, atlas_path, roles, breeding), "provenance": provenance}
 
     return {
         "problem": problem,
@@ -632,6 +672,10 @@ def _run(
 
 def _num(x: float | None) -> str:
     return "n/a" if x is None else f"{x:.2f}"
+
+
+def _usd(x: float | None) -> str:
+    return "n/a" if x is None else f"${x:.3f}"
 
 
 def _clip(text: str, n: int) -> str:
@@ -705,7 +749,7 @@ def format_report(report: dict) -> str:
             if measured.get("comparable"):
                 lines.append(
                     f"    {kind} in the same race: accuracy {_num(measured['accuracy'])} (n={measured['n']}) vs "
-                    f"{_num(rec['accuracy'])} (n={rec['n']}), ${measured['cost_per_1k_usd']:.3f} vs ${rec['cost_per_1k_usd']:.3f} per 1k"
+                    f"{_num(rec['accuracy'])} (n={rec['n']}), {_usd(measured['cost_per_1k_usd'])} vs {_usd(rec['cost_per_1k_usd'])} per 1k"
                 )
             else:
                 lines.append(

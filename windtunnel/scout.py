@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -56,7 +57,7 @@ class Source:
 
     @property
     def verified(self) -> bool:
-        """True when the record came from a scholarly index with a resolvable ID."""
+        """True when the record came from a scholarly index and carries an arXiv ID or DOI (not resolved here)."""
         return self.kind == "paper" and bool(self.arxiv_id or self.doi)
 
     @property
@@ -73,6 +74,8 @@ class Source:
     def merge(self, other: Source) -> None:
         if self.kind == "web" and other.kind == "paper":  # an index record beats a web page for the same title
             self.kind, self.url = other.kind, other.url
+            if other.abstract:  # the paper's own abstract, not the web page's snippet, now backs the "verified" card
+                self.abstract = other.abstract
         for name in ("abstract", "venue", "arxiv_id", "doi", "year", "citation_count"):
             if not getattr(self, name) and getattr(other, name):
                 setattr(self, name, getattr(other, name))
@@ -84,16 +87,49 @@ class Source:
 
 
 class Fetcher:
-    """HTTP with a disk cache, per-host pacing and retries on 429/5xx."""
+    """HTTP with a disk cache, per-host pacing and retries on 429/5xx.
+
+    The cache keeps at most `max_cache_files` responses; past that the oldest are deleted, so a
+    stream of new search queries cannot fill the disk.
+    """
 
     MIN_INTERVAL = {"export.arxiv.org": 3.0, "api.semanticscholar.org": 1.1}
+    PRUNE_EVERY = 100  # cache writes between size checks
 
-    def __init__(self, cache_dir: str | Path | None = ".windtunnel/cache", timeout: float = 30.0, retries: int = 3):
+    def __init__(
+        self,
+        cache_dir: str | Path | None = ".windtunnel/cache",
+        timeout: float = 30.0,
+        retries: int = 3,
+        max_cache_files: int | None = None,
+    ):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.client = httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": "windtunnel/0.1"})
         self.retries = retries
+        self.max_cache_files = max_cache_files if max_cache_files is not None else int(os.environ.get("WINDTUNNEL_CACHE_MAX_FILES", "5000"))
+        self._writes = 0
         self._last: dict[str, float] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _cache_key(method: str, url: str, params: dict | None, json_body: dict | None) -> str:
+        return hashlib.sha256(json.dumps([method, url, params, json_body], sort_keys=True).encode()).hexdigest()
+
+    def is_cached(self, method: str, url: str, *, params: dict | None = None, json_body: dict | None = None) -> bool:
+        return bool(self.cache_dir and (self.cache_dir / f"{self._cache_key(method, url, params, json_body)}.txt").is_file())
+
+    def prune_cache(self) -> int:
+        """Delete the oldest cached responses past max_cache_files. Returns how many were deleted."""
+        if not self.cache_dir or not self.cache_dir.is_dir() or self.max_cache_files <= 0:
+            return 0
+        files = list(self.cache_dir.glob("*.txt"))
+        excess = len(files) - self.max_cache_files
+        if excess <= 0:
+            return 0
+        files.sort(key=lambda f: f.stat().st_mtime)
+        for f in files[:excess]:
+            f.unlink(missing_ok=True)
+        return excess
 
     def _pace(self, host: str) -> None:
         interval = self.MIN_INTERVAL.get(host, 0.0)
@@ -104,7 +140,7 @@ class Fetcher:
             time.sleep(wait)
 
     def request(self, method: str, url: str, *, params: dict | None = None, json_body: dict | None = None, headers: dict | None = None) -> str:
-        cache_key = hashlib.sha256(json.dumps([method, url, params, json_body], sort_keys=True).encode()).hexdigest()
+        cache_key = self._cache_key(method, url, params, json_body)
         cache_file = self.cache_dir / f"{cache_key}.txt" if self.cache_dir else None
         if cache_file and cache_file.is_file():
             return cache_file.read_text()
@@ -121,6 +157,11 @@ class Fetcher:
             if cache_file:
                 cache_file.parent.mkdir(parents=True, exist_ok=True)
                 cache_file.write_text(resp.text)
+                with self._lock:
+                    self._writes += 1
+                    prune = self._writes % self.PRUNE_EVERY == 0
+                if prune:
+                    self.prune_cache()
             return resp.text
         raise AssertionError("unreachable")
 
@@ -231,11 +272,46 @@ def search_semantic_scholar(query: str, limit: int, fetcher: Fetcher) -> list[So
     return [s for s in sources if s.title]
 
 
+class TavilyCapReached(RuntimeError):
+    pass
+
+
+class _CallCap:
+    """Sliding-window cap on paid calls in this process. Tavily is billed per search and sits outside BudgetGuard."""
+
+    def __init__(self, env_var: str, default: int, window_s: float = 3600.0):
+        self.env_var, self.default, self.window_s = env_var, default, window_s
+        self._calls: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    @property
+    def limit(self) -> int:
+        return int(os.environ.get(self.env_var, str(self.default)))
+
+    def take(self) -> bool:
+        """Count one call. False (and nothing counted) when the window is already full."""
+        now = time.monotonic()
+        with self._lock:
+            while self._calls and now - self._calls[0] > self.window_s:
+                self._calls.popleft()
+            if len(self._calls) >= self.limit:
+                return False
+            self._calls.append(now)
+            return True
+
+
+TAVILY_CAP = _CallCap("WINDTUNNEL_TAVILY_PER_HOUR", 60)
+
+
 def search_tavily(query: str, limit: int, fetcher: Fetcher) -> list[Source]:
     key = os.environ.get("TAVILY_API_KEY")
     if not key:
         return []
     body = {"query": query, "max_results": limit, "search_depth": "basic", "include_answer": False}
+    cached = getattr(fetcher, "is_cached", None)
+    if not (cached and cached("POST", "https://api.tavily.com/search", json_body=body)) and not TAVILY_CAP.take():
+        # Raised, so scout() records "tavily failed for ...: TavilyCapReached" in the run's warnings.
+        raise TavilyCapReached(f"Tavily cap of {TAVILY_CAP.limit} paid searches per hour reached")
     data = json.loads(
         fetcher.request("POST", "https://api.tavily.com/search", json_body=body, headers={"Authorization": f"Bearer {key}"})
     )

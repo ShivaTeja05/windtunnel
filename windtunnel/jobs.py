@@ -1,10 +1,10 @@
 """Background runs for the web app, plus the report store.
 
-A run executes the stages in order (plain LLM, research, design, race, advisor) on a
-worker thread. Each stage records its status, its partial result and a model-receipt
-entry (which model or heuristic did the work, and what it cost), so the UI can show
-progress live. Finished runs are written to `.windtunnel/reports/{id}.json` and survive
-a restart.
+A run calls `engine.run_wind_tunnel` on a worker thread, so the web app and the CLI
+produce the same report. The engine's progress callback drives the run's live stages
+(status, timing and, for real runs, a live count of model calls), so the UI can show
+progress while the run is going. Finished runs are written to
+`.windtunnel/reports/{id}.json` and survive a restart.
 
 Without NEBIUS_API_KEY everything still runs: research is offline (real paper search,
 heuristic cards), the race uses MockClient and is labelled "mock", and the plain-LLM
@@ -13,7 +13,9 @@ answer and the advisor are reported as unavailable.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -26,25 +28,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .advisor import llm_pick
-from .baseline import plain_llm_answer
-from .generate import design_candidates
-from .graph import to_mermaid
-from .llm import Completion, LLMClient, MockClient
-from .models import CATALOG
-from .racer import RaceConfig, race
-from .report import to_dict as race_to_dict
-from .research import research
-from .scout import PROVIDERS, Provider
+from .breed import FAILURE_MODES
+from .budget import BudgetExceeded, worst_case_prompt_tokens
+from .designs import Design
+from .engine import STAGES as ENGINE_STAGES
+from .engine import run_wind_tunnel
+from .graph import graph_for
+from .llm import Completion, LLMClient
+from .models import CATALOG, get_model
+from .scout import PROVIDERS, Fetcher, Provider
 from .task import Constraints, Example, TaskSpec, load_task
 
-STAGES = ["plain_llm", "research", "design", "race", "advisor"]
+# Bump when the report's shape changes. Together with a fingerprint of the engine's code and
+# the sample's files it names the cached sample runs, so a stale cache is never replayed.
+REPORT_VERSION = 2
+
+# The engine's stages, plus "breed": it runs inside the engine's race stage, and the UI shows it as its own step.
+STAGES = [s for stage in ENGINE_STAGES for s in ([stage, "breed"] if stage == "race" else [stage])]
 STAGE_TITLES = {
-    "plain_llm": "Ask a plain LLM",
+    "plain_llm_answer": "Ask a plain LLM",
     "research": "Search papers & extract methods",
-    "design": "Design candidate architectures",
+    "design_candidates": "Design candidate architectures",
     "race": "Race candidates on your examples",
-    "advisor": "Ask the LLM which it would pick",
+    "breed": "Diagnose losers & breed fixes",
+    "llm_pick": "Ask the LLM which it would pick",
+    "limitations": "Work out the limitations",
 }
 
 LIMITS = {
@@ -55,7 +63,8 @@ LIMITS = {
     "label_chars": 60,
 }
 
-TASKS_DIR = Path(__file__).resolve().parent.parent / "tasks"
+PACKAGE_DIR = Path(__file__).resolve().parent
+TASKS_DIR = PACKAGE_DIR.parent / "tasks"
 
 
 def _now() -> str:
@@ -64,6 +73,10 @@ def _now() -> str:
 
 class InvalidRun(ValueError):
     pass
+
+
+class ServerBusy(RuntimeError):
+    """Too many runs are queued or running; the caller should try again later."""
 
 
 # ---------------------------------------------------------------- environment
@@ -76,6 +89,8 @@ class Environment:
     client: LLMClient | None  # None means offline (no Nemotron)
     providers: dict[str, Provider]
     max_sources: int = 15
+    fetcher: Fetcher | None = None  # None: the scout's own HTTP fetcher with its disk cache
+    atlas_path: str | Path | None = None  # append raced designs to the Outcome Atlas when set
 
     @property
     def mode(self) -> str:
@@ -98,14 +113,39 @@ def default_environment() -> Environment:
 
 
 class CountingClient:
-    """Wraps a client to count calls and cost, so a running stage can report live progress."""
+    """Wraps a client to count calls and cost, so a running stage can report live progress.
 
-    def __init__(self, client: LLMClient, on_call: Callable[[Completion], None]):
+    With `limit_usd` it is also the run's own spending cap: like BudgetGuard, each call first
+    reserves its worst-case cost and is refused with BudgetExceeded if the run would pass the
+    cap, so one visitor's run cannot use up the budget every other visitor shares.
+    """
+
+    def __init__(self, client: LLMClient, on_call: Callable[[Completion], None], limit_usd: float | None = None):
         self.client = client
         self.on_call = on_call
+        self.limit_usd = limit_usd
+        self.spent_usd = 0.0
+        self._reserved = 0.0
+        self._lock = threading.Lock()
 
-    def complete(self, model: str, messages: list[dict], *, temperature: float = 0.0, max_tokens: int = 1024) -> Completion:
-        completion = self.client.complete(model, messages, temperature=temperature, max_tokens=max_tokens)
+    def complete(self, model: str, messages: list[dict], **kw) -> Completion:
+        worst = 0.0
+        if self.limit_usd is not None:
+            worst = get_model(model).cost(worst_case_prompt_tokens(messages), kw.get("max_tokens", 1024))
+            with self._lock:
+                if self.spent_usd + self._reserved + worst > self.limit_usd:
+                    raise BudgetExceeded(
+                        f"this run's spending cap of ${self.limit_usd:.2f} was reached (${self.spent_usd:.4f} spent). "
+                        "Race fewer or shorter examples, or raise WINDTUNNEL_RUN_BUDGET_USD."
+                    )
+                self._reserved += worst
+        try:
+            completion = self.client.complete(model, messages, **kw)
+        finally:
+            with self._lock:
+                self._reserved -= worst
+        with self._lock:
+            self.spent_usd += completion.cost_usd
         self.on_call(completion)
         return completion
 
@@ -172,8 +212,11 @@ def validate_request(body: dict) -> dict:
     sample = body.get("sample") or None
     examples = body.get("examples") or []
     labels = body.get("labels") or None
+    breed = body.get("breed", True)
     if sample is not None and not isinstance(sample, str):
         raise InvalidRun("sample must be a string")
+    if not isinstance(breed, bool):
+        raise InvalidRun("breed must be true or false")
     if not problem and sample:
         problem = sample_problem(build_task("", None, None, sample))
     if len(problem) < 15:
@@ -202,7 +245,93 @@ def validate_request(body: dict) -> dict:
         labels = [str(x).strip()[: LIMITS["label_chars"]] for x in labels if str(x).strip()] or None
     if sample and clean:
         raise InvalidRun("pass either a sample or your own examples, not both")
-    return {"problem": problem, "sample": sample, "examples": clean, "labels": labels}
+    return {"problem": problem, "sample": sample, "examples": clean, "labels": labels, "breed": breed}
+
+
+# ---------------------------------------------------------------- the web report
+
+
+def finite_json(obj: Any) -> Any:
+    """A copy that strict JSON accepts: NaN and infinity become None (an unmeasured design has no accuracy)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {str(k): finite_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [finite_json(v) for v in obj]
+    return obj
+
+
+def strict_dumps(obj: Any, **kw) -> str:
+    return json.dumps(finite_json(obj), allow_nan=False, default=str, **kw)
+
+
+def tiers_for(row: dict) -> list[str]:
+    """Every model tier a design runs, from its graph (so a cascade's escalation tier shows), cheapest first."""
+    try:
+        models = graph_for(Design(row["id"], row["family"], row["model"], dict(row.get("params") or {}))).models()
+    except (KeyError, ValueError, TypeError):
+        models = [row["model"]] if row.get("model") else []
+    return sorted(models, key=lambda m: list(CATALOG).index(m) if m in CATALOG else len(CATALOG))
+
+
+def web_report(report: dict) -> dict:
+    """The engine's report for the browser: per-example outputs dropped, model tiers added, strict-JSON safe."""
+    out = finite_json(report)
+    race_d = out.get("race")
+    if race_d:
+        for row in race_d["designs"]:
+            row.pop("outputs", None)  # keeps stored reports small; scores and errors are already summarised
+            row["tiers"] = tiers_for(row)
+    breeding = out.get("breeding") or {}
+    for past in breeding.get("races", []):
+        for row in past["designs"]:
+            row["tiers"] = tiers_for(row)
+    for b in breeding.get("bred", []):
+        b["tiers"] = tiers_for(b)
+    if breeding:
+        breeding["failure_mode_help"] = dict(FAILURE_MODES)
+    return out
+
+
+def _breed_detail(report: dict) -> tuple[str, str]:
+    """(status, detail) of the breed step, from the finished report."""
+    b = report.get("breeding")
+    if b is None:
+        return "skipped", "no labelled examples"
+    if not b.get("enabled"):
+        return "skipped", "turned off for this run"
+    diagnosed = [d for gen in b.get("diagnoses", []) for d in gen]
+    bred = b.get("bred", [])
+    if b.get("final_on_holdout"):
+        held = f", final race on {len(b['holdout_ids'])} held-out examples"
+    elif b.get("holdout_ids"):
+        held = ", held-out split kept back but no confirmation race ran on it"
+    else:
+        held = ", no held-out split"
+    return "done", f"{len(diagnosed)} diagnosed, {len(bred)} bred{held}"
+
+
+def weak_report(report: dict) -> str | None:
+    """Why a finished report must not be replayed as the cached sample run, or None if it may be.
+
+    A sample run is served to every visitor as "cached, instant", so one cut short by the spending
+    cap, an API failure or a failed search would otherwise stick until the code changes.
+    """
+    race_d = report.get("race") or {}
+    if race_d.get("aborted") or (report.get("verdict") or {}).get("aborted"):
+        return "the race stopped early"
+    if not (report.get("research") or {}).get("cards"):
+        return "the search returned no sources"
+    for entry in report.get("model_receipt") or []:
+        if "budget exhausted" in str(entry.get("detail")):
+            return f"{entry.get('stage')} hit the spending cap"
+    if report.get("mode") == "nemotron":
+        if not (report.get("plain_answer") or {}).get("available"):
+            return "the plain-LLM answer is missing"
+        if not (report.get("advisor") or {}).get("available"):
+            return "the LLM advisor pick is missing"
+    return None
 
 
 # ---------------------------------------------------------------- the run
@@ -217,11 +346,15 @@ class Run:
     created_at: str = field(default_factory=_now)
     status: str = "queued"  # queued, running, done, error
     stages: dict[str, dict] = field(default_factory=dict)
-    results: dict[str, Any] = field(default_factory=dict)
-    receipt: list[dict] = field(default_factory=list)
+    report: dict | None = None  # the engine's report (see web_report) once the run is done
+    live: dict = field(default_factory=lambda: {"calls": 0, "cost_usd": 0.0})
     error: str | None = None
     finished_at: str | None = None
     cached_from: str | None = None
+    cacheable: bool = True  # False when the run was cut short (spending cap, failed search), so it is never replayed
+    report_version: int | None = REPORT_VERSION  # None for reports written before the engine-backed runs
+    current: str | None = field(default=None, repr=False)
+    t0: dict[str, float] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         if not self.stages:
@@ -233,20 +366,21 @@ class Run:
             "status": self.status,
             "mode": self.mode,
             "race_provenance": self.race_provenance,
+            "report_version": self.report_version,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "request": self.request,
-            "stages": [self.stages[s] for s in STAGES],
-            "results": self.results,
-            "receipt": self.receipt,
-            "limitations": limitations(self),
+            "stages": list(self.stages.values()),
+            "live": self.live,
+            "report": self.report,
             "error": self.error,
             "cached_from": self.cached_from,
+            "cacheable": self.cacheable,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> Run:
-        run = cls(
+        return cls(
             id=d["id"],
             request=d["request"],
             mode=d["mode"],
@@ -254,51 +388,25 @@ class Run:
             created_at=d["created_at"],
             status=d["status"],
             stages={s["key"]: s for s in d["stages"]},
-            results=d["results"],
-            receipt=d["receipt"],
+            report=d.get("report"),
+            live=d.get("live") or {"calls": 0, "cost_usd": 0.0},
             error=d.get("error"),
             finished_at=d.get("finished_at"),
             cached_from=d.get("cached_from"),
+            cacheable=d.get("cacheable", True),
+            report_version=d.get("report_version"),  # missing: written by the old pipeline
         )
-        return run
 
 
-def limitations(run: Run) -> list[str]:
-    """The 'When not to trust this verdict' box."""
-    out: list[str] = []
-    race_d = run.results.get("race")
-    research_d = run.results.get("research")
-    if run.race_provenance == "mock" and race_d:
-        out.append(
-            "MOCK RACE: model answers were simulated from fixed per-tier accuracy rates. The numbers test the "
-            "plumbing only. They say nothing about how Nemotron performs on your task."
-        )
-    if race_d:
-        n = race_d["task"]["n_examples"]
-        if n < 100:
-            out.append(
-                f"Only {n} labelled examples. Confidence intervals are wide, so small accuracy gaps are noise. "
-                "Use 200+ real examples before you commit."
-            )
-        if race_d["task"].get("provenance"):
-            out.append(f"Data: {race_d['task']['provenance']}")
-        out.append(
-            "Measured on these examples only. If live traffic looks different (new topics, other languages, longer "
-            "inputs), re-run on a sample of it."
-        )
-        out.append("Costs use Token Factory list prices and measured token counts. Latency depends on load at run time.")
-    elif research_d:
-        out.append("No labelled examples were given, so nothing was raced. The designs are untested suggestions.")
-    if run.mode == "offline" and research_d:
-        out.append(
-            "OFFLINE research: real paper search, but the search plan and method cards come from keyword "
-            "heuristics, not Nemotron. Family labels can be wrong."
-        )
-    out.append(
-        "Only the built-in architecture families are raced. A design outside them (fine-tuning, retrieval "
-        "over your own data, tools) may beat all of these."
-    )
-    return out
+def code_fingerprint(tasks_dir: Path, sample: str) -> str:
+    """Changes whenever the report version, the engine's code or the sample's files change."""
+    h = hashlib.sha256(f"report-v{REPORT_VERSION}".encode())
+    files = sorted(PACKAGE_DIR.glob("*.py")) + sorted(PACKAGE_DIR.glob("*.json")) + sorted((tasks_dir / sample).glob("*"))
+    for path in files:
+        if path.is_file():
+            h.update(path.name.encode())
+            h.update(path.read_bytes())
+    return h.hexdigest()[:10]
 
 
 class JobStore:
@@ -310,14 +418,25 @@ class JobStore:
         reports_dir: str | Path = ".windtunnel/reports",
         tasks_dir: Path = TASKS_DIR,
         max_workers: int = 2,
+        max_in_flight: int | None = None,
+        max_reports: int | None = None,
+        run_budget_usd: float | None = None,
     ):
         self.env_factory = env_factory
         self.reports_dir = Path(reports_dir)
         self.tasks_dir = tasks_dir
+        # Queued plus running runs, across all clients: past this, new runs are refused, not queued for hours.
+        self.max_in_flight = max_in_flight if max_in_flight is not None else int(os.environ.get("WINDTUNNEL_MAX_IN_FLIGHT", "10"))
+        # User reports kept on disk; the oldest are deleted past this (sample runs are kept as share pages).
+        self.max_reports = max_reports if max_reports is not None else int(os.environ.get("WINDTUNNEL_MAX_REPORTS", "1000"))
+        # Each real run's own spending cap, inside the shared BudgetGuard cap.
+        self.run_budget_usd = run_budget_usd if run_budget_usd is not None else float(os.environ.get("WINDTUNNEL_RUN_BUDGET_USD", "0.5"))
         self._runs: dict[str, Run] = {}
         self._lock = threading.RLock()
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="windtunnel-run")
         self._env: Environment | None = None
+        self._fingerprints: dict[str, str] = {}
+        self.prune_reports()
 
     @property
     def env(self) -> Environment:
@@ -333,39 +452,87 @@ class JobStore:
     def _save(self, run: Run) -> None:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         tmp = self._path(run.id).with_suffix(".tmp")
-        tmp.write_text(json.dumps(run.to_dict(), indent=1, default=str))
+        tmp.write_text(strict_dumps(run.to_dict(), indent=1))
         tmp.replace(self._path(run.id))
 
     def get(self, run_id: str) -> Run | None:
-        if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", run_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,128}", run_id):
             return None
         with self._lock:
             if run_id in self._runs:
                 return self._runs[run_id]
-        path = self._path(run_id)
-        if path.is_file():
-            try:
-                return Run.from_dict(json.loads(path.read_text()))
-            except (json.JSONDecodeError, KeyError):
+            path = self._path(run_id)
+            if not path.is_file():
                 return None
-        return None
+            try:
+                run = Run.from_dict(json.loads(path.read_text()))
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return None
+            if run.status in ("queued", "running"):
+                # Not in memory, so the process that owned it is gone: it will never finish.
+                self._interrupted(run)
+            return run
+
+    def _interrupted(self, run: Run) -> None:
+        run.status = "error"
+        run.error = "The server restarted while this run was in progress, so it did not finish. Start it again."
+        run.finished_at = run.finished_at or _now()
+        for st in run.stages.values():
+            if st["status"] == "running":
+                st.update(status="error", detail=run.error)
+            elif st["status"] == "pending":
+                st["status"] = "skipped"
+        try:
+            self._save(run)
+        except OSError:
+            pass
+
+    def prune_reports(self) -> list[Path]:
+        """Delete the oldest user reports past max_reports, so the disk can't be filled one run at a time.
+
+        Sample runs are kept: their share links must keep working across redeploys.
+        """
+        if not self.reports_dir.is_dir() or self.max_reports <= 0:
+            return []
+        with self._lock:
+            live = set(self._runs)
+            paths = [p for p in self.reports_dir.glob("*.json") if not p.name.startswith("sample-") and p.stem not in live]
+            excess = len(paths) - self.max_reports
+            if excess <= 0:
+                return []
+            paths.sort(key=lambda p: p.stat().st_mtime)
+            removed = paths[:excess]
+            for path in removed:
+                path.unlink(missing_ok=True)
+            return removed
 
     # -- sample cache
 
+    def _fingerprint(self, sample: str) -> str:
+        if sample not in self._fingerprints:
+            self._fingerprints[sample] = code_fingerprint(self.tasks_dir, sample)
+        return self._fingerprints[sample]
+
     def _cache_key(self, req: dict) -> str | None:
-        if not req.get("sample"):
+        if not req.get("sample") or not req.get("breed", True):
             return None
         task = build_task("", None, None, req["sample"], self.tasks_dir)
         if req["problem"] != sample_problem(task):
             return None  # a sample with an edited problem is a fresh run
-        return f"sample-{req['sample']}-{self.env.mode}"
+        # The full sample name (already limited to [\w-]); the fingerprint makes runs of other code a cache miss.
+        return f"sample-{req['sample']}-{self.env.mode}-{self._fingerprint(req['sample'])}"
 
     def cached(self, req: dict) -> Run | None:
+        """The finished sample run for this request, if the current code made one that may be replayed.
+
+        Sample runs from other code or report versions are never replayed, but they are kept on disk,
+        so their share links keep working after a redeploy.
+        """
         key = self._cache_key(req)
         if not key:
             return None
         run = self.get(key)
-        if run and run.status == "done":
+        if run and run.status == "done" and run.report_version == REPORT_VERSION and run.cacheable:
             return run
         with self._lock:  # a cache-filling run is already in flight
             live = self._runs.get(key)
@@ -373,8 +540,24 @@ class JobStore:
 
     # -- running
 
+    def in_flight(self) -> int:
+        with self._lock:
+            return sum(r.status in ("queued", "running") for r in self._runs.values())
+
+    def busy(self) -> bool:
+        return self.in_flight() >= self.max_in_flight
+
+    def busy_message(self) -> str:
+        return (
+            f"The server is busy: {self.max_in_flight} runs are already queued or running. "
+            "Try again in a few minutes, or try a sample (cached, instant)."
+        )
+
     def submit(self, req: dict, *, use_cache: bool = True) -> tuple[Run, bool]:
-        """Start a run (or return the cached sample run). Returns (run, was_cached)."""
+        """Start a run (or return the cached sample run). Returns (run, was_cached).
+
+        Raises ServerBusy when max_in_flight runs are already queued or running.
+        """
         if use_cache:
             hit = self.cached(req)
             if hit:
@@ -384,7 +567,14 @@ class JobStore:
         env = self.env
         run = Run(id=run_id, request=req, mode=env.mode, race_provenance=env.race_provenance)
         with self._lock:
+            if self.busy():
+                raise ServerBusy(self.busy_message())
             self._runs[run_id] = run
+            try:
+                self._save(run)  # on disk from the start, so a restart reports it as interrupted, not missing
+            except OSError:
+                traceback.print_exc()
+        self.prune_reports()
         self._pool.submit(self._execute, run, env)
         return run, False
 
@@ -395,250 +585,103 @@ class JobStore:
             except Exception:  # warming is best effort
                 traceback.print_exc()
 
-    def _put(self, run: Run, key: str, value) -> None:
-        with self._lock:
-            run.results[key] = value
-
-    def _receipt(self, run: Run, *entries: dict) -> None:
-        with self._lock:
-            run.receipt.extend(entries)
-
     def snapshot(self, run: Run) -> dict:
         with self._lock:
-            return json.loads(json.dumps(run.to_dict(), default=str))
+            return json.loads(strict_dumps(run.to_dict()))
 
-    def _stage(self, run: Run, key: str, **updates) -> None:
+    # -- progress from the engine
+
+    def _progress(self, run: Run, stage: str, status: str) -> None:
         with self._lock:
-            run.stages[key].update(updates)
+            st = run.stages.get(stage)
+            if st is None:
+                return
+            if status == "running":
+                run.current = stage
+                run.t0[stage] = time.perf_counter()
+                st.update(status="running", started_at=_now())
+                if stage == "race" and run.request.get("breed", True):
+                    run.stages["breed"]["detail"] = "starts after the first race"
+                return
+            st.update(status="error" if status == "failed" else status, finished_at=_now())
+            if stage in run.t0:
+                st["seconds"] = round(time.perf_counter() - run.t0[stage], 2)
+            if run.current == stage:
+                run.current = None
+            if stage == "race" and status in ("done", "skipped"):
+                breed = run.stages["breed"]
+                if status == "skipped":
+                    breed.update(status="skipped", detail="no labelled examples")
+                elif run.request.get("breed", True):
+                    breed.update(status="done", detail="ran inside the race stage", finished_at=_now())
+
+    def _on_call(self, run: Run, completion: Completion) -> None:
+        with self._lock:
+            run.live["calls"] += 1
+            run.live["cost_usd"] = round(run.live["cost_usd"] + completion.cost_usd, 6)
+            if run.current:
+                st = run.stages[run.current]
+                st["calls"] = st.get("calls", 0) + 1
 
     def _execute(self, run: Run, env: Environment) -> None:
         req = run.request
-        run.status = "running"
+        with self._lock:
+            run.status = "running"
+            if not req.get("breed", True):
+                run.stages["breed"].update(status="skipped", detail="turned off for this run")
         try:
             task = build_task(req["problem"], req["examples"], req["labels"], req["sample"], self.tasks_dir)
-            self._plain(run, env)
-            research_result = self._research(run, env)
-            candidates = self._design(run, env, research_result)
-            race_result = self._race(run, env, task, candidates)
-            self._advisor(run, env, task, candidates)
-            self._put(run, "verdict", verdict_summary(run, race_result))
-            run.status = "done"
+            # Real clients are already BudgetGuard-wrapped; the counter counts calls for the live view and
+            # enforces a visitor's own per-run cap (a sample run is paid for once, then served from the cache).
+            run_cap = None if run.id.startswith("sample-") else self.run_budget_usd
+            client = CountingClient(env.client, lambda c: self._on_call(run, c), limit_usd=run_cap) if env.client is not None else None
+            report = run_wind_tunnel(
+                req["problem"],
+                task,
+                client,
+                providers=env.providers,
+                fetcher=env.fetcher,
+                breed=req.get("breed", True),
+                progress=lambda stage, status: self._progress(run, stage, status),
+                max_sources=env.max_sources,
+                atlas_path=env.atlas_path,
+            )
+            report = web_report(report)
+            with self._lock:
+                for entry in report["model_receipt"]:
+                    st = run.stages.get(entry["stage"])
+                    if st is not None:
+                        st.update(
+                            detail=entry["detail"] or st["detail"],
+                            produced_by=entry["produced_by"],
+                            cost_usd=entry["cost_usd"],
+                            seconds=entry["seconds"],
+                        )
+                        if "simulated_cost_usd" in entry:
+                            st["simulated_cost_usd"] = entry["simulated_cost_usd"]
+                status, detail = _breed_detail(report)
+                run.stages["breed"].update(status=status, detail=detail)
+                run.report = report
+                run.race_provenance = report["provenance"]
+                run.status = "done"
+                weak = weak_report(report)
+                if weak:
+                    run.cacheable = False  # kept as this run's page, never replayed to other visitors
+                    if run.id.startswith("sample-"):
+                        print(f"[windtunnel] sample run {run.id} is not cached: {weak}", flush=True)
         except Exception as exc:
             traceback.print_exc()
-            run.status = "error"
-            run.error = f"{type(exc).__name__}: {exc}"
-            for s in run.stages.values():
-                if s["status"] == "running":
-                    s["status"] = "error"
-                    s["detail"] = run.error
-                elif s["status"] == "pending":
-                    s["status"] = "skipped"
+            with self._lock:
+                run.status = "error"
+                run.error = f"{type(exc).__name__}: {exc}"
+                for s in run.stages.values():
+                    if s["status"] in ("running", "error"):
+                        s["status"] = "error"
+                        s["detail"] = run.error
+                    elif s["status"] == "pending":
+                        s["status"] = "skipped"
         finally:
             run.finished_at = _now()
             with self._lock:
                 self._save(run)
                 self._runs.pop(run.id, None)
-
-    def _timed(self, run: Run, key: str):
-        self._stage(run, key, status="running", started_at=_now())
-        return time.perf_counter()
-
-    def _done(self, run: Run, key: str, t0: float, status: str = "done", detail: str = "") -> None:
-        self._stage(run, key, status=status, detail=detail, seconds=round(time.perf_counter() - t0, 2), finished_at=_now())
-
-    def _plain(self, run: Run, env: Environment) -> None:
-        t0 = self._timed(run, "plain_llm")
-        answer = plain_llm_answer(run.request["problem"], env.client)
-        d = answer.to_dict()
-        self._put(run, "plain_llm", d)
-        self._receipt(run, 
-            {
-                "stage": "plain_llm",
-                "what": "Plain-LLM answer (no search, no tests)",
-                "by": f"Nemotron {answer.model.title()}" if answer.available else "not run (offline)",
-                "model_id": CATALOG[answer.model].id if answer.available else None,
-                "cost_usd": answer.cost_usd,
-                "provenance": "nemotron" if answer.available else "unavailable",
-            }
-        )
-        self._done(run, "plain_llm", t0, "done" if answer.available else "skipped", "" if answer.available else "needs Nemotron")
-
-    def _research(self, run: Run, env: Environment):
-        t0 = self._timed(run, "research")
-        self._stage(run, "research", detail=f"searching {', '.join(env.providers)}")
-        result = research(run.request["problem"], env.client, providers=env.providers, max_sources=env.max_sources)
-        d = result.to_dict()
-        self._put(run, "research", d)
-        verified = sum(c.verified for c in result.cards)
-        by_card = sorted({c.extracted_by for c in result.cards}) or ["none"]
-        self._receipt(run, *[
-            {
-                "stage": "research",
-                "what": "L1 understand: problem → search plan",
-                "by": _who(result.spec.produced_by),
-                "model_id": CATALOG[result.spec.produced_by].id if result.spec.produced_by in CATALOG else None,
-                "cost_usd": result.spec.cost_usd,
-                "provenance": result.mode,
-            },
-            {
-                "stage": "research",
-                "what": f"L2 scout: {len(result.scout.sources)} sources from {', '.join(env.providers)}",
-                "by": "search APIs (real)",
-                "model_id": None,
-                "cost_usd": 0.0,
-                "provenance": "real",
-            },
-            {
-                "stage": "research",
-                "what": f"L3 extract: {len(result.cards)} method cards, {verified} with verified IDs",
-                "by": ", ".join(_who(b) for b in by_card),
-                "model_id": ", ".join(CATALOG[b].id for b in by_card if b in CATALOG) or None,
-                "cost_usd": sum(c.cost_usd for c in result.cards),
-                "provenance": result.mode,
-            },
-        ])
-        self._done(run, "research", t0, detail=f"{len(result.cards)} methods, {verified} verified")
-        return result
-
-    def _design(self, run: Run, env: Environment, result):
-        t0 = self._timed(run, "design")
-        candidates = design_candidates(result.spec, result.cards, env.client)
-        out = []
-        for c in candidates:
-            d = c.to_dict()
-            d["mermaid"] = mermaid_for(c.graph, c.design.family)
-            d["tiers"] = c.graph.models()
-            out.append(d)
-        self._put(run, "candidates", out)
-        gens = sorted({c.generated_by for c in candidates})
-        self._receipt(run, 
-            {
-                "stage": "design",
-                "what": f"L4 design: {len(candidates)} candidate architectures + diagrams",
-                "by": ", ".join(_who(g) for g in gens),
-                "model_id": ", ".join(CATALOG[g].id for g in gens if g in CATALOG) or None,
-                "cost_usd": sum(float(getattr(c, "cost_usd", 0.0) or 0.0) for c in candidates),
-                "provenance": "nemotron" if any(g in CATALOG for g in gens) else "offline",
-            }
-        )
-        self._done(run, "design", t0, detail=f"{len(candidates)} candidates")
-        return candidates
-
-    def _race(self, run: Run, env: Environment, task: TaskSpec | None, candidates):
-        if task is None:
-            self._stage(run, "race", status="skipped", detail="no labelled examples")
-            return None
-        t0 = self._timed(run, "race")
-        base = env.client if env.client is not None else MockClient.for_task(task)
-        stats = {"calls": 0, "cost": 0.0}
-        lock = threading.Lock()
-        n_designs, n_ex = len(candidates), len(task.examples)
-
-        def on_call(c: Completion) -> None:
-            with lock:
-                stats["calls"] += 1
-                stats["cost"] += c.cost_usd
-                self._stage(run, "race", detail=f"{stats['calls']} model calls · {n_designs} designs × up to {n_ex} examples", calls=stats["calls"])
-
-        client = CountingClient(base, on_call)
-        result = race(task, [c.design for c in candidates], client, RaceConfig())
-        d = race_to_dict(result, None, run.race_provenance)
-        for row in d["designs"]:
-            row.pop("outputs", None)  # keep reports small; scores are summarised already
-            row["errors"] = len(row.get("errors") or {})
-        self._put(run, "race", d)
-        tiers = sorted({c.design.model for c in candidates} | {c.design.params.get("worker_model") for c in candidates if c.design.params.get("worker_model")})
-        self._receipt(run, 
-            {
-                "stage": "race",
-                "what": f"L5 race: {result.total_calls} calls on {n_ex} examples",
-                "by": ("MockClient (simulated " if env.client is None else "Nemotron ") + ", ".join(t.title() for t in tiers) + (")" if env.client is None else ""),
-                "model_id": None if env.client is None else ", ".join(CATALOG[t].id for t in tiers),
-                "cost_usd": 0.0 if env.client is None else result.total_cost_usd,
-                "simulated_cost_usd": result.total_cost_usd if env.client is None else None,
-                "provenance": run.race_provenance,
-            }
-        )
-        self._done(run, "race", t0, detail=f"{result.total_calls} model calls · winner {result.recommended_id}")
-        return result
-
-    def _advisor(self, run: Run, env: Environment, task: TaskSpec | None, candidates) -> None:
-        if env.client is None:
-            default = next((c for c in candidates if c.role == "llm-default"), None)
-            self._put(run, "advisor", {
-                "available": False,
-                "model": "ultra",
-                "design_id": None,
-                "typical_default_id": default.design.id if default else None,
-                "reply": "Needs Nemotron (offline mode).",
-                "cost_usd": 0.0,
-            })
-            self._receipt(run, {"stage": "advisor", "what": "LLM advisor pick", "by": "not run (offline)", "model_id": None, "cost_usd": 0.0, "provenance": "unavailable"})
-            self._stage(run, "advisor", status="skipped", detail="needs Nemotron")
-            return
-        t0 = self._timed(run, "advisor")
-        advisor_task = task or TaskSpec("custom", run.request["problem"], "", "exact", [])
-        pick = llm_pick(advisor_task, [c.design for c in candidates], env.client)
-        self._put(run, "advisor", {"available": True, "model": pick.model, "design_id": pick.design_id, "reply": pick.reply, "cost_usd": pick.cost_usd})
-        self._receipt(run, 
-            {"stage": "advisor", "what": "LLM advisor pick", "by": f"Nemotron {pick.model.title()}", "model_id": CATALOG[pick.model].id, "cost_usd": pick.cost_usd, "provenance": "nemotron"}
-        )
-        self._done(run, "advisor", t0, detail=f"picked {pick.design_id or 'no valid design'}")
-
-
-def mermaid_for(graph, family: str) -> str:
-    # Fan-out designs read better top-down; chains read better left to right.
-    return to_mermaid(graph, "TD" if family == "orchestrator_workers" else "LR")
-
-
-def _who(by: str) -> str:
-    return f"Nemotron {by.title()}" if by in CATALOG else ("keyword heuristic (offline)" if "heuristic" in by else by)
-
-
-def verdict_summary(run: Run, race_result) -> dict:
-    """The headline for 'Without vs With'."""
-    cands = {c["id"]: c for c in run.results.get("candidates", [])}
-    research_d = run.results.get("research") or {}
-    cards = research_d.get("cards", [])
-    out: dict[str, Any] = {
-        "sources": len(cards),
-        "verified_sources": sum(1 for c in cards if c.get("verified")),
-        "candidates": len(cands),
-        "tested": race_result is not None,
-        "provenance": run.race_provenance if race_result is not None else "untested",
-    }
-    if race_result is None:
-        return out
-    rec = race_result.recommended_id
-    out.update(
-        recommended_id=rec,
-        best_id=race_result.best_id,
-        tied_ids=race_result.tied_ids,
-        verdict=race_result.verdict,
-        n_examples=len(race_result.task.examples),
-    )
-    if rec:
-        r = race_result.get(rec)
-        lo, hi = r.accuracy_ci(race_result.config.confidence, race_result.config.seed)
-        out["recommended"] = {
-            "id": rec,
-            "family": r.design.family,
-            "model": r.design.model,
-            "accuracy": r.accuracy,
-            "accuracy_ci": [lo, hi],
-            "cost_per_1k_usd": r.cost_per_1k,
-            "p50_latency_s": r.p50_latency_s,
-            "based_on": cands.get(rec, {}).get("based_on", []),
-        }
-        default = next((c for c in cands.values() if c["role"] == "llm-default"), None)
-        if default and default["id"] != rec:
-            d = race_result.get(default["id"])
-            out["vs_llm_default"] = {
-                "id": default["id"],
-                "accuracy": d.accuracy,
-                "cost_per_1k_usd": d.cost_per_1k,
-                "cost_ratio": d.cost_per_1k / max(r.cost_per_1k, 1e-12),
-                "eliminated": not d.alive,
-                "elimination_reason": d.elimination_reason,
-            }
-    return out

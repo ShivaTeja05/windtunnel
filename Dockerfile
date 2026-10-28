@@ -2,6 +2,10 @@
 #   docker build -t windtunnel .
 #   docker run -p 8000:8000 -e NEBIUS_API_KEY=... -e TAVILY_API_KEY=... windtunnel
 # Without NEBIUS_API_KEY it runs offline: real paper search, mock race, all labelled.
+# Behind a reverse proxy (a PaaS load balancer, nginx, Cloudflare), add
+#   -e WINDTUNNEL_TRUST_PROXY=1 [-e WINDTUNNEL_TRUSTED_PROXIES=<proxy CIDRs>] [-e WINDTUNNEL_PROXY_HOPS=<n>]
+# so the rate limit sees client addresses. Never set it without a proxy in front: clients
+# could then write X-Forwarded-For themselves and skip the rate limit.
 FROM python:3.11-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
@@ -10,9 +14,12 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
-    WINDTUNNEL_TRUST_PROXY=1 \
+    WINDTUNNEL_TRUST_PROXY=0 \
     WINDTUNNEL_WARM_SAMPLES=1 \
     WINDTUNNEL_RUNS_PER_HOUR=5 \
+    WINDTUNNEL_RUNS_PER_DAY=10 \
+    WINDTUNNEL_RUN_BUDGET_USD=0.5 \
+    WINDTUNNEL_MAX_IN_FLIGHT=10 \
     WINDTUNNEL_BUDGET_USD=10
 
 WORKDIR /app

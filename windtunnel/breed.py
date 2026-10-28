@@ -531,6 +531,7 @@ class BreedingResult:
     holdout_ids: list[str]  # empty when there were too few examples to hold any out
     provenance: str  # "mock" or "measured"
     note: str
+    final_on_holdout: bool = False  # the deciding race ran on the held-out split, so selection bias is controlled
 
     @property
     def final(self) -> RaceResult:
@@ -550,6 +551,7 @@ class BreedingResult:
             "lineage": self.lineage,
             "search_ids": self.search_ids,
             "holdout_ids": self.holdout_ids,
+            "final_on_holdout": self.final_on_holdout,
             "recommended_id": self.recommended_id,
         }
 
@@ -689,4 +691,5 @@ def race_with_breeding(
         holdout_ids=[e.id for e in holdout.examples] if holdout else [],
         provenance="mock" if mock else "measured",
         note=note,
+        final_on_holdout=holdout is not None and final.task is holdout,
     )

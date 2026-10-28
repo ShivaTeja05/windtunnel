@@ -163,3 +163,89 @@ def test_failed_extraction_still_counts_its_spend():
     cards, _ = extract_cards([src], understand_offline("classify"), ScriptedClient(["not json", "still not"]))
     assert cards[0].extracted_by == "offline-heuristic"
     assert cards[0].cost_usd == 2 * Completion("", "super", 100, 50, 0.1).cost_usd
+
+
+class PlanThenGarbage:
+    """Ultra writes a usable plan; every card reply is unusable, so every card falls back to the heuristic."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, model, messages, *, temperature=0.0, max_tokens=1024):
+        self.calls += 1
+        if self.calls == 1:
+            plan = '{"summary": "Route tickets", "problem_types": ["classification"], "search_queries": ["q1"], "analogy_queries": []}'
+            return Completion(plan, model, 100, 50, 0.1)
+        return Completion("not json", model, 100, 50, 0.1)
+
+
+def test_research_mode_says_what_produced_the_outputs():
+    from types import SimpleNamespace
+
+    from windtunnel.research import research_mode
+
+    result = research("classify support tickets", PlanThenGarbage(), providers=fake_providers(), fetcher=object())
+    assert result.cards and all(c.extracted_by == "offline-heuristic" for c in result.cards)
+    assert result.mode == "mixed"  # a client was passed, but the cards came from the heuristic
+
+    offline_spec = understand_offline("classify")
+    model_card, offline_card = SimpleNamespace(extracted_by="super"), SimpleNamespace(extracted_by="offline-heuristic")
+    assert research_mode(object(), offline_spec, [offline_card, offline_card]) == "offline"
+    assert research_mode(object(), offline_spec, [model_card]) == "mixed"
+    assert research_mode(None, offline_spec, [model_card]) == "offline"
+    offline_spec.produced_by = "ultra"
+    assert research_mode(object(), offline_spec, [model_card]) == "nemotron"
+
+
+def test_web_record_merged_into_a_paper_takes_the_paper_abstract():
+    web = Source("Self-Consistency", "https://blog.example/sc", "web", abstract="A blog post says voting is great.", found_via=["tavily"])
+    paper = Source("Self-Consistency", "https://arxiv.org/abs/2203.11171", "paper", 2022, arxiv_id="2203.11171",
+                   abstract="We propose self-consistency.", found_via=["arxiv"])
+    web.merge(paper)
+    assert web.kind == "paper" and web.verified and web.abstract == "We propose self-consistency."
+
+
+class CacheFetcher:
+    def __init__(self, cached=False):
+        self.cached, self.requests = cached, 0
+
+    def is_cached(self, method, url, *, params=None, json_body=None):
+        return self.cached
+
+    def request(self, method, url, **kw):
+        self.requests += 1
+        return '{"results": [{"title": "T", "url": "https://example.org/t", "content": "c"}]}'
+
+
+def test_tavily_searches_are_capped_but_cached_ones_are_free(monkeypatch):
+    from windtunnel import scout as scout_mod
+
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setenv("WINDTUNNEL_TAVILY_PER_HOUR", "2")
+    monkeypatch.setattr(scout_mod, "TAVILY_CAP", scout_mod._CallCap("WINDTUNNEL_TAVILY_PER_HOUR", 60))
+    fetcher = CacheFetcher()
+    assert scout_mod.search_tavily("q1", 3, fetcher) and scout_mod.search_tavily("q2", 3, fetcher)
+    with pytest.raises(scout_mod.TavilyCapReached):
+        scout_mod.search_tavily("q3", 3, fetcher)
+    assert fetcher.requests == 2  # the refused search never reached the paid API
+    assert scout_mod.search_tavily("q1", 3, CacheFetcher(cached=True))  # a cache hit costs nothing, so it is allowed
+
+    # In a search, the cap shows up as a provider warning instead of sinking the run.
+    spec = understand_offline("classify tickets")
+    spec.search_queries, spec.analogy_queries = ["q4"], []
+    result = scout(spec, providers={"tavily": scout_mod.search_tavily}, fetcher=fetcher)
+    assert any("TavilyCapReached" in w for w in result.warnings)
+
+
+def test_search_cache_is_pruned_to_its_size_cap(tmp_path):
+    import os
+
+    from windtunnel.scout import Fetcher
+
+    fetcher = Fetcher(cache_dir=tmp_path, max_cache_files=3)
+    for i in range(6):
+        f = tmp_path / f"{i}.txt"
+        f.write_text("x")
+        os.utime(f, (1000 + i, 1000 + i))
+    assert fetcher.prune_cache() == 3
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["3.txt", "4.txt", "5.txt"]

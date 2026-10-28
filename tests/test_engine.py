@@ -298,3 +298,94 @@ def test_advisor_comparison_says_when_numbers_come_from_another_race():
     pick.update(comparable=False, measured_in="initial (search split)", n=10)
     text = format_report(report)
     assert "measured in initial (search split): accuracy" in text and "not comparable" in text
+
+
+# ---------------------------------------------------------------- honest comparisons and labels
+
+
+def test_unmeasured_llm_default_has_no_cost_not_zero():
+    class FlakyUltra(MockClient):
+        def complete(self, model, messages, **kw):
+            if model == "ultra":
+                raise ConnectionError("Token Factory unreachable")
+            return super().complete(model, messages, **kw)
+
+    task = make_task()
+    report, _ = run(task, FlakyUltra.for_task(task))
+    vs = report["verdict"]["vs_llm_default"]
+    assert vs["n"] == 0 and vs["accuracy"] is None and vs["cost_per_1k_usd"] is None
+    format_report(report)  # the text report copes with a missing cost
+
+
+def test_plain_answer_lost_to_the_cap_does_not_claim_offline_mode():
+    from windtunnel.budget import BudgetExceeded
+
+    class CapOnPlain(FakeNemotron):
+        def complete(self, model, messages, **kw):
+            if messages[-1]["content"].startswith("I'm building this"):
+                raise BudgetExceeded("spending cap reached")
+            return super().complete(model, messages, **kw)
+
+    task = make_task()
+    report, _ = run(task, CapOnPlain(task))
+    plain = report["plain_answer"]
+    assert report["mode"] == "nemotron" and plain["available"] is False
+    assert "spending cap" in plain["text"] and "offline" not in plain["text"].lower()
+    assert receipt(report)["plain_llm_answer"]["detail"] == "budget exhausted"
+
+
+def test_selection_bias_is_present_when_the_deciding_race_never_ran_on_the_holdout(monkeypatch):
+    from windtunnel import breed
+
+    real_race, calls = breed.race, []
+
+    def race_stopped_in_generation_1(*args, **kwargs):
+        result = real_race(*args, **kwargs)
+        calls.append(result)
+        if len(calls) == 2:  # the generation-1 race on the search split hits the spending cap
+            result.aborted = "spending cap reached"
+        return result
+
+    monkeypatch.setattr(breed, "race", race_stopped_in_generation_1)
+    report, _ = run(make_task(70), config=RaceConfig(seed=1), generations=2)
+    b = report["breeding"]
+    assert b["holdout_ids"] and b["bred"] and report["race"]["role"] == "generation 1"
+    assert b["final_on_holdout"] is False and b["selection_bias"].startswith("present")
+    assert any("optimistic until confirmed" in item for item in report["limitations"])
+
+
+def test_atlas_marks_bred_designs_and_selection_bias(tmp_path):
+    report, _ = run(make_task(), atlas_path=tmp_path / "outcomes.jsonl")
+    records = [json.loads(line) for line in (tmp_path / "outcomes.jsonl").read_text().splitlines()]
+    bred_ids = {b["id"] for b in report["breeding"]["bred"]}
+    bred = [r for r in records if r["design"]["id"] in bred_ids]
+    assert bred and all(r["origin"] == "bred" and r["selection_biased"] and r["race_role"].startswith("generation") for r in bred)
+    assert all(r["lineage"]["parent_id"] for r in bred)
+    first = [r for r in records if r["design"]["id"] not in bred_ids]
+    assert first and all(r["origin"] == "candidate" and not r["selection_biased"] and r["race_role"] == "initial" for r in first)
+
+
+def test_held_out_bred_records_are_not_marked_biased(tmp_path):
+    report, _ = run(make_task(70), config=RaceConfig(seed=1), atlas_path=tmp_path / "outcomes.jsonl")
+    records = [json.loads(line) for line in (tmp_path / "outcomes.jsonl").read_text().splitlines()]
+    confirmed = [r for r in records if r["race_role"] == "confirmation (held-out split)"]
+    assert report["breeding"]["final_on_holdout"] is True
+    assert all(not r["selection_biased"] for r in confirmed)
+
+
+def test_precomputed_research_and_candidates_are_raced_as_shown():
+    from windtunnel.generate import design_candidates
+    from windtunnel.research import research
+
+    found = research(PROBLEM, None, providers=fake_providers(), fetcher=object())
+    shown = design_candidates(found.spec, found.cards, None)
+
+    def no_search(*a, **kw):
+        raise AssertionError("reused research must not search again")
+
+    report = run_wind_tunnel(PROBLEM, make_task(), None, providers={"arxiv": no_search}, fetcher=object(), breed=False,
+                             research_result=found, candidates=shown)
+    assert [c["id"] for c in report["candidates"]] == [c.design.id for c in shown]
+    assert {d["id"] for d in report["race"]["designs"]} == {c.design.id for c in shown}
+    r = receipt(report)
+    assert "reused" in r["research"]["detail"] and "reused" in r["design_candidates"]["detail"]

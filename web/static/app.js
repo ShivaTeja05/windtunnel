@@ -9,6 +9,7 @@ const FAMILY_NAMES = {
   self_consistency: "Self-consistency vote",
   plan_execute: "Plan, then execute",
   orchestrator_workers: "Orchestrator + workers",
+  cascade: "Cascade",
   retrieval: "Retrieval (RAG)",
   fine_tuning: "Fine-tuning",
   other: "Other methods",
@@ -23,6 +24,7 @@ const ROLE_HINTS = {
 };
 const MODE_TEXT = {
   offline: "OFFLINE",
+  mixed: "PARTLY OFFLINE",
   nemotron: "NEMOTRON",
   mock: "MOCK",
   measured: "MEASURED",
@@ -39,15 +41,16 @@ let routeToken = 0;
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const pct = (x) => (x == null ? "–" : `${Math.round(x * 100)}%`);
+const num = (x) => typeof x === "number" && Number.isFinite(x);
+const pct = (x) => (num(x) ? `${Math.round(x * 100)}%` : "–");
 const usd = (x) => {
-  if (x == null) return "–";
+  if (!num(x)) return "–";
   if (x === 0) return "$0";
   if (x < 0.01) return `$${x.toFixed(4)}`;
   if (x < 10) return `$${x.toFixed(3)}`;
   return `$${x.toFixed(2)}`;
 };
-const secs = (x) => (x == null ? "–" : `${x < 10 ? x.toFixed(2) : x.toFixed(1)}s`);
+const secs = (x) => (num(x) ? `${x < 10 ? x.toFixed(2) : x.toFixed(1)}s` : "–");
 const pill = (kind, label) => `<span class="pill pill-${esc(kind)}">${esc(label || MODE_TEXT[kind] || kind)}</span>`;
 const tier = (t) => `<span class="tier tier-${esc(t)}">${esc(TIER_NAMES[t] || t)}</span>`;
 const designName = (d) => `${FAMILY_NAMES[d.family] || d.family} · ${TIER_NAMES[d.model] || d.model}`;
@@ -58,7 +61,11 @@ async function api(path, opts = {}) {
   try {
     body = await res.json();
   } catch (e) {}
-  if (!res.ok) throw new Error((body && body.detail) || `${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const err = new Error((body && body.detail) || `${res.status} ${res.statusText}`);
+    err.status = res.status;
+    throw err;
+  }
   return body;
 }
 
@@ -115,7 +122,7 @@ function renderDiagrams(root) {
 const diagram = (src) => `<div class="diagram" data-src="${esc(src)}"></div>`;
 
 const tierLegend = () =>
-  `<div class="legend"><span>Model that runs each step:</span>${["nano", "super", "ultra", "lightning"].map(tier).join("")}<span class="faint">· grey = input/output, no model</span></div>`;
+  `<div class="legend"><span>Model that runs each step:</span>${TIERS.map(tier).join("")}<span class="faint">· grey = input/output, no model · dashed arrow = a branch only some inputs take</span></div>`;
 
 // ------------------------------------------------------------------ router
 
@@ -230,6 +237,7 @@ async function viewHome(token) {
       ["3", "Extract", "Turns each source into a method card. The citation comes from the index, never from the model.", ["super"]],
       ["4", "Design", "Builds candidate architectures from the cards, each with a diagram of exactly what will run.", ["ultra"]],
       ["5", "Race", "Runs every candidate on your examples, eliminates losers early, picks the cheapest tied winner.", ["nano", "super", "ultra"]],
+      ["6", "Breed", "Diagnoses why the losers failed, borrows a fix from another field and races the bred designs.", ["ultra"]],
     ]
       .map(
         ([n, t, d, tiers]) =>
@@ -335,20 +343,44 @@ function viewNew() {
 }
 
 // ------------------------------------------------------------------ run / report
+//
+// GET /api/runs/{id} returns the run's live stages while it runs and, once it is done, the
+// engine's report (engine.run_wind_tunnel) under `report`. Sections render from the report;
+// while it is missing they show the live stage status instead.
 
 async function viewRun(token, runId) {
   app.innerHTML = `<div class="skeleton"><span class="spinner"></span>Loading report…</div>`;
   const rendered = {};
   let first = true;
+  let failures = 0;
   while (token === routeToken) {
     let run;
     try {
       run = await api(`/api/runs/${runId}`);
+      failures = 0;
     } catch (e) {
-      app.innerHTML = `<div class="skeleton"><h1>Report not found</h1><p class="mt muted">${esc(e.message)}</p><p class="mt"><a href="/" data-link>Start a new run</a></p></div>`;
-      return;
+      // Only a 404 means there is no such run. A network blip or a 5xx while the server redeploys is retried.
+      if (e.status === 404 || failures >= 8) {
+        if (token !== routeToken) return;
+        const title = e.status === 404 ? "Report not found" : "Can't reach the server";
+        app.innerHTML = `<div class="skeleton"><h1>${title}</h1><p class="mt muted">${esc(e.message)}</p><p class="mt">${
+          e.status === 404 ? "" : `<a href="/r/${esc(runId)}" data-link>Try again</a> · `
+        }<a href="/" data-link>Start a new run</a></p></div>`;
+        return;
+      }
+      failures += 1;
+      const msg = `Connection problem (${e.message}); retrying…`;
+      const err = document.getElementById("run-error");
+      if (err) {
+        err.textContent = msg;
+        err.hidden = false;
+      } else app.innerHTML = `<div class="skeleton"><span class="spinner"></span>${esc(msg)}</div>`;
+      await new Promise((r) => setTimeout(r, Math.min(15000, 1000 * 2 ** failures)));
+      continue;
     }
     if (token !== routeToken) return;
+    const err = document.getElementById("run-error");
+    if (err && err.textContent.startsWith("Connection problem")) err.hidden = true;
     if (first) {
       app.innerHTML = runShell(run);
       bindShare(run);
@@ -360,6 +392,13 @@ async function viewRun(token, runId) {
   }
 }
 
+const hasExamples = (run) => !!(run.request.sample || (run.request.examples || []).length);
+
+function racePill(run) {
+  if (!hasExamples(run) || run.race_provenance === "untested") return pill("untested", "NO RACE");
+  return run.race_provenance === "measured" ? pill("measured", "MEASURED RACE") : pill("mock", "MOCK RACE");
+}
+
 function runShell(run) {
   const offline = run.mode === "offline";
   const title = run.request.sample ? run.request.sample.replace(/_/g, " ") : "Your task";
@@ -369,19 +408,15 @@ function runShell(run) {
       <h1 style="margin-top:6px;text-transform:capitalize">${esc(title)}</h1>
       <p class="problem">${esc(run.request.problem)}</p></div>
     <div class="run-meta">
-      ${pill(run.mode)} ${
-        run.request.sample || (run.request.examples || []).length
-          ? pill(run.race_provenance === "mock" ? "mock" : "measured", run.race_provenance === "mock" ? "MOCK RACE" : "MEASURED RACE")
-          : pill("untested", "NO RACE")
-      }
+      ${pill(run.mode)} <span id="race-pill">${racePill(run)}</span>
       <button class="btn btn-sm" id="share">Copy share link</button>
       <a class="btn btn-sm" href="/new" data-link>Run your own</a>
     </div>
   </div>
   ${
     offline
-      ? `<div class="banner mock"><span>⚠</span><div><strong>Offline demo mode.</strong> This server has no Nemotron API key yet. The paper search is
-     <b>real</b>, but method cards and designs come from keyword heuristics, and the race answers are <b>simulated</b> (MOCK) from fixed per-tier
+      ? `<div class="banner mock"><span>⚠</span><div><strong>OFFLINE demo mode.</strong> This server has no Nemotron API key yet. The paper search is
+     <b>real</b>, but method cards and designs come from keyword heuristics, and the race answers are <b>SIMULATED</b> (MOCK) from fixed per-tier
      accuracy rates. Treat every number below as a demo of the pipeline, <b>not</b> as a result.</div></div>`
       : ""
   }
@@ -390,7 +425,9 @@ function runShell(run) {
   <section class="section" id="sec-a"></section>
   <section class="section" id="sec-b"></section>
   <section class="section" id="sec-c"></section>
-  <section class="section" id="sec-d"></section>`;
+  <section class="section" id="sec-d"></section>
+  <section class="section" id="sec-e"></section>
+  <section class="section" id="sec-f"></section>`;
 }
 
 function bindShare(run) {
@@ -405,25 +442,37 @@ function bindShare(run) {
   };
 }
 
+function stageDetail(s) {
+  if (s.status === "pending") return s.detail || "waiting";
+  if (s.status === "running") return s.calls ? `${s.calls} model call${s.calls === 1 ? "" : "s"} so far` : s.detail || "running…";
+  const time = s.seconds != null && s.status === "done" && s.key !== "breed" ? ` · ${secs(s.seconds)}` : "";
+  return `${s.detail || s.status}${time}`;
+}
+
 function updateRun(run, rendered) {
   const stages = Object.fromEntries(run.stages.map((s) => [s.key, s]));
   document.getElementById("stepper").innerHTML = run.stages
     .map(
       (s) => `<div class="st ${esc(s.status)}"><div class="t"><span class="dot"></span>${esc(s.title)}</div>
-      <div class="d" title="${esc(s.detail)}">${esc(s.status === "pending" ? "waiting" : s.detail || s.status)}${s.seconds != null && s.status === "done" ? ` · ${secs(s.seconds)}` : ""}</div></div>`,
+      <div class="d" title="${esc(s.detail)}">${esc(stageDetail(s))}</div></div>`,
     )
     .join("");
+  document.getElementById("race-pill").innerHTML = racePill(run);
   if (run.error) {
     const el = document.getElementById("run-error");
     el.textContent = `This run failed: ${run.error}`;
     el.hidden = false;
   }
-  const r = run.results;
+  const status = (k) => [stages[k]?.status, stages[k]?.calls];
+  const done = !!run.report;
+  const legacy = run.report_version == null && run.status === "done";
   const sections = {
-    "sec-a": [() => [r.plain_llm, r.verdict, run.status], () => sectionA(run)],
-    "sec-b": [() => [r.research?.finished_at, stages.research.status], () => sectionB(run)],
-    "sec-c": [() => [r.candidates?.length, r.verdict?.recommended_id, stages.design.status], () => sectionC(run)],
-    "sec-d": [() => [stages.race.status, stages.race.calls, stages.advisor.status, run.status], () => sectionD(run)],
+    "sec-a": [() => [done, legacy, run.status], () => (legacy ? legacyNotice(run) : sectionA(run))],
+    "sec-b": [() => [done, legacy, status("research")], () => (legacy ? "" : sectionB(run))],
+    "sec-c": [() => [done, legacy, status("design_candidates")], () => (legacy ? "" : sectionC(run))],
+    "sec-d": [() => [done, legacy, status("race")], () => (legacy ? "" : sectionD(run))],
+    "sec-e": [() => [done, legacy, status("race"), status("breed")], () => (legacy ? "" : sectionE(run))],
+    "sec-f": [() => [done, legacy, run.status, status("llm_pick")], () => (legacy ? "" : sectionF(run))],
   };
   for (const [id, [sig, render]] of Object.entries(sections)) {
     const key = JSON.stringify(sig());
@@ -438,62 +487,131 @@ function updateRun(run, rendered) {
         b.remove();
       }),
     );
+    el.querySelectorAll("[data-race-tab]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const i = b.dataset.raceTab;
+        el.querySelectorAll("[data-race-tab]").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+        el.querySelectorAll("[data-race-panel]").forEach((p) => (p.hidden = p.dataset.racePanel !== i));
+      }),
+    );
   }
 }
+
+function legacyNotice(run) {
+  return `<div class="card skeleton">This report was made by an earlier version of Wind Tunnel and can no longer be shown.
+    ${run.request.sample ? `<p class="mt"><button class="btn btn-sm" data-rerun>Run the sample again</button></p>` : `<p class="mt"><a href="/new" data-link>Start a new run</a></p>`}</div>`;
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-rerun]");
+  if (!b) return;
+  const id = location.pathname.split("/").pop();
+  api(`/api/runs/${id}`)
+    .then((run) => startRun({ sample: run.request.sample }, b))
+    .catch((err) => toast(err.message));
+});
 
 const head = (letter, title, sub, pills = "") =>
   `<div class="section-head"><span class="section-letter">${letter}</span><h2>${title}</h2>${pills}${sub ? `<span class="sub">${sub}</span>` : ""}</div>`;
 
 const waiting = (msg) => `<div class="card skeleton"><span class="spinner"></span>${esc(msg)}</div>`;
 
-function cardIndex(run) {
-  return Object.fromEntries((run.results.research?.cards || []).map((c) => [c.source_key, c]));
+function stageWait(run, key, runningMsg, pendingMsg) {
+  const s = run.stages.find((x) => x.key === key) || {};
+  if (s.status === "running") return waiting(s.calls ? `${runningMsg} (${s.calls} model calls so far)` : runningMsg);
+  if (s.status === "error" || run.status === "error") return `<div class="card skeleton">This step did not finish.</div>`;
+  if (s.status === "done" || s.status === "skipped") return waiting("Finishing the report…");
+  return waiting(pendingMsg);
 }
+
+function cardIndex(report) {
+  return Object.fromEntries((report.research?.cards || []).map((c) => [c.source_key, c]));
+}
+
+const isMock = (report) => report.provenance === "mock";
+const unmeasuredCount = (x) => (typeof x === "number" ? x : Array.isArray(x) ? x.length : Object.keys(x || {}).length);
+const ciText = (ci) => (ci && ci[0] != null && ci[1] != null ? `${pct(ci[0])}–${pct(ci[1])}` : "not measured");
+const prettyMode = (m) => String(m || "").replace(/_/g, " ");
+const tiersOf = (d) => [...(d.tiers || [d.model])].sort((a, b) => TIERS.indexOf(a) - TIERS.indexOf(b));
+
+// The cost ratio of the LLM default over the recommendation, when both were measured in the same race.
+function costRatio(rec, vs) {
+  if (!rec || !vs || !vs.comparable) return null;
+  const a = vs.cost_per_1k_usd;
+  const b = rec.cost_per_1k_usd;
+  return a > 0 && b > 0 ? a / b : null;
+}
+
+// Whether the deciding race ran on held-out examples. Reports written before final_on_holdout existed fall back to the split.
+const finalOnHoldout = (b) => (b.final_on_holdout != null ? !!b.final_on_holdout : !!(b.holdout_ids || []).length);
+
+function selectionBiasPresent(report) {
+  const b = report.breeding;
+  return !!(b && b.enabled && (b.bred || []).length && !finalOnHoldout(b));
+}
+
+// A comparison design with no measured runs has no accuracy and no cost, not a cost of $0.
+const unmeasured = (d) => !d || d.accuracy == null || !d.n;
 
 // ---------- A. Without vs With
 
 function sectionA(run) {
-  const r = run.results;
-  const plain = r.plain_llm;
-  const v = r.verdict;
-  const mock = run.race_provenance === "mock";
+  const report = run.report;
+  const title = head("A", "Without vs With Wind Tunnel", "The same question, answered from memory and answered with evidence.");
+  if (!report) return title + stageWait(run, "plain_llm_answer", "Asking a plain LLM…", "Starting…");
+  const plain = report.plain_answer;
+  const v = report.verdict;
+  const mock = isMock(report);
   const sim = mock ? `<span class="sim">SIMULATED</span>` : "";
-  const cands = r.candidates || [];
-  const llmDefault = cands.find((c) => c.role === "llm-default");
+  const llmDefault = (report.candidates || []).find((c) => c.role === "llm-default");
+  const cards = report.research?.cards || [];
 
-  let without;
-  if (!plain) without = `<p class="muted"><span class="spinner"></span>Asking…</p>`;
-  else if (plain.available) without = `<blockquote>${esc(plain.text)}</blockquote>`;
-  else
-    without = `<p class="muted">${esc(plain.text)}</p>
+  const without = plain.available
+    ? `<blockquote>${esc(plain.text)}</blockquote>`
+    : `<p class="muted">${esc(plain.text)}</p>
       <p class="small muted">Asked from memory, LLMs most often recommend a <b>multi-agent orchestrator on a large model</b>.
-      Wind Tunnel puts that design${llmDefault ? ` (<code>${esc(llmDefault.id)}</code>)` : ""} in the race so you can see what it really costs.</p>`;
+      ${
+        v.tested
+          ? `Wind Tunnel puts that design${llmDefault ? ` (<code>${esc(llmDefault.id)}</code>)` : ""} in the race so you can see what it really costs.`
+          : `Wind Tunnel would race that design${llmDefault ? ` (<code>${esc(llmDefault.id)}</code>)` : ""} once you add labelled examples, so you can see what it really costs.`
+      }</p>`;
 
   let withHtml;
-  if (!v) withHtml = `<p class="muted"><span class="spinner"></span>Researching, designing and racing…</p>`;
-  else if (!v.tested)
-    withHtml = `<div class="big">${v.candidates} designs found, untested</div>
+  if (!v.tested)
+    withHtml = `<div class="big">${(report.candidates || []).length} designs found, untested</div>
       <p class="muted small">No labelled examples were given, so nothing was raced. Add 10+ examples to get a measured verdict.</p>`;
-  else if (!v.recommended) withHtml = `<div class="big">No design met the constraints</div><p class="muted">${esc(v.verdict)}</p>`;
+  else if (!v.recommended)
+    withHtml = `<div class="big">${v.aborted ? "INCOMPLETE: no recommendation" : "No recommendation"}</div><p class="muted">${esc(v.text)}</p>`;
   else {
     const rec = v.recommended;
     const vs = v.vs_llm_default;
+    const ratio = costRatio(rec, vs);
+    let third;
+    if (!vs) third = [`–`, llmDefault && llmDefault.id === rec.id ? "it is the LLM default" : "LLM default not measured"];
+    else if (vs.accuracy == null) third = ["–", "LLM default not measured (infrastructure errors)"];
+    else if (ratio == null) third = ["–", vs.comparable ? "cost vs the LLM default" : "LLM default measured in another race"];
+    else if (ratio >= 1) third = [`${ratio.toFixed(1)}×`, `cheaper than the LLM default${mock ? " (simulated)" : ""}`];
+    else third = [`${(1 / ratio).toFixed(1)}×`, `the LLM default's cost${mock ? " (simulated)" : ""}`];
+    const bred = rec.origin === "bred";
     withHtml = `
-      <div><div class="big">${esc(designName(rec))}</div><div class="faint small mono">${esc(rec.id)}</div></div>
+      <div><div class="big">${esc(designName(rec))}</div><div class="faint small mono">${esc(rec.id)}${bred ? ` <span class="badge badge-bred">bred</span>` : ""}</div></div>
       <div class="facts">
-        <div class="fact"><div class="v">${pct(rec.accuracy)}${sim}</div><div class="k">accuracy (95% CI ${pct(rec.accuracy_ci[0])}–${pct(rec.accuracy_ci[1])})</div></div>
+        <div class="fact"><div class="v">${pct(rec.accuracy)}${sim}</div><div class="k">accuracy (95% CI ${ciText(rec.accuracy_ci)}, n=${rec.n})</div></div>
         <div class="fact"><div class="v">${usd(rec.cost_per_1k_usd)}</div><div class="k">per 1k requests${mock ? " (simulated)" : ""}</div></div>
-        <div class="fact"><div class="v">${vs ? `${vs.cost_ratio.toFixed(1)}×` : "–"}</div><div class="k">${vs ? `cheaper than the LLM default` : "it is the LLM default"}</div></div>
+        <div class="fact"><div class="v">${third[0]}</div><div class="k">${third[1]}</div></div>
       </div>
-      <p class="small">${esc(v.verdict)}</p>`;
+      ${bred && selectionBiasPresent(report) ? `<p class="small bias-inline">⚠ Bred design: its score is optimistic (selection bias, no held-out split). See section E.</p>` : ""}
+      <p class="small">${esc(v.text)}</p>`;
   }
   const checks = (items) =>
     `<ul class="checks">${items.map(([ok, t]) => `<li><span class="${ok ? "y" : "n"}">${ok ? "✓" : "✗"}</span><span>${t}</span></li>`).join("")}</ul>`;
+  const nCands = (report.candidates || []).length;
+  const nBred = (report.breeding?.bred || []).length;
 
-  return `${head("A", "Without vs With Wind Tunnel", "The same question, answered from memory and answered with evidence.")}
+  return `${title}
   <div class="vs">
     <div class="card vs-card without">
-      <div class="lbl"><span>Without · plain LLM</span>${plain ? pill(plain.available ? "nemotron" : "unavailable") : ""}</div>
+      <div class="lbl"><span>Without · plain LLM</span>${pill(plain.available ? "nemotron" : "unavailable")}</div>
       ${without}
       ${checks([
         [false, "searched papers or the web"],
@@ -503,18 +621,19 @@ function sectionA(run) {
       ])}
     </div>
     <div class="card vs-card with" style="position:relative">
-      <div class="lbl"><span>With Wind Tunnel · verdict</span>${v ? pill(v.tested ? (mock ? "mock" : "measured") : "untested") : ""}</div>
+      <div class="lbl"><span>With Wind Tunnel · verdict</span>${pill(v.tested ? (mock ? "mock" : "measured") : "untested")}</div>
       ${withHtml}
-      ${
-        v
-          ? checks([
-              [v.sources > 0, `searched papers: <b>${v.sources}</b> sources, <b>${v.verified_sources}</b> with verified IDs`],
-              [v.candidates > 1, `compared <b>${v.candidates}</b> candidate architectures`],
-              [v.tested, v.tested ? `tested on <b>${v.n_examples}</b> labelled examples${mock ? " (simulated answers)" : ""}` : "not tested (no examples)"],
-              [v.tested, v.tested ? `measured cost and latency${mock ? " (simulated)" : ""}` : "cost and latency not measured"],
-            ])
-          : ""
-      }
+      ${checks([
+        [cards.length > 0, `searched papers: <b>${cards.length}</b> sources, <b>${cards.filter((c) => c.verified).length}</b> with verified IDs`],
+        [
+          v.tested && nCands > 1,
+          v.tested
+            ? `compared <b>${nCands}</b> candidate architectures${nBred ? ` and <b>${nBred}</b> bred design${nBred === 1 ? "" : "s"}` : ""}`
+            : `proposed <b>${nCands}</b> candidate architectures, not compared (no examples)`,
+        ],
+        [v.tested, v.tested ? `tested on <b>${v.n_examples}</b> labelled examples${mock ? " (SIMULATED answers)" : ""}` : "not tested (no examples)"],
+        [v.tested, v.tested ? `measured cost and latency${mock ? " (SIMULATED)" : ""}` : "cost and latency not measured"],
+      ])}
     </div>
   </div>`;
 }
@@ -522,16 +641,21 @@ function sectionA(run) {
 // ---------- B. Methods map
 
 function sectionB(run) {
-  const res = run.results.research;
-  const st = run.stages.find((s) => s.key === "research");
-  if (!res) return head("B", "Methods found") + waiting(st.status === "running" ? `${st.detail || "Searching papers"}…` : "Waiting to search…");
-  const cards = cardIndex(run);
+  const report = run.report;
+  if (!report) return head("B", "Methods found") + stageWait(run, "research", "Searching papers and extracting methods…", "Waiting to search…");
+  const res = report.research;
+  const cards = cardIndex(report);
   const groups = Object.entries(res.methods_map || {});
-  const modePill = pill(res.mode, res.mode === "offline" ? "OFFLINE CARDS" : "NEMOTRON CARDS");
+  const modePill = pill(res.mode, res.mode === "offline" ? "OFFLINE CARDS" : res.mode === "mixed" ? "PARTLY OFFLINE CARDS" : "NEMOTRON CARDS");
   const verified = res.cards.filter((c) => c.verified).length;
-  const sub = `${res.cards.length} sources from real searches (${esc((run.receipt.find((x) => x.what.startsWith("L2")) || {}).what?.split("from ")[1] || "papers")}), ${verified} with verified IDs, grouped by approach family.${
-    res.mode === "offline" ? " Families and summaries come from a keyword heuristic, so some labels may be wrong." : ""
+  const sub = `${res.cards.length} sources from real searches, ${verified} with verified IDs, grouped by approach family.${
+    res.mode === "offline"
+      ? " OFFLINE: families and summaries come from a keyword heuristic, so some labels may be wrong."
+      : res.mode === "mixed"
+        ? " PARTLY OFFLINE: some cards or the search plan fell back to a keyword heuristic (see the warnings)."
+        : ""
   }`;
+  if (!res.cards.length) return `${head("B", "Methods found", sub, modePill)}<div class="card skeleton">The search returned no sources, so the candidates below are generic templates.</div>`;
   return `${head("B", "Methods found", sub, modePill)}
   ${groups
     .map(([family, keys]) => {
@@ -548,12 +672,17 @@ function methodCard(c, hidden) {
   const cite = c.citation || {};
   const authors = (cite.authors || []).slice(0, 3).join(", ") + ((cite.authors || []).length > 3 ? " et al." : "");
   const flags = (c.flags || []).map((f) => `<span class="badge badge-${esc(f)}">${esc(f)}</span>`).join("");
-  const rel = "●".repeat(c.relevance) + "○".repeat(3 - c.relevance);
+  const r = Math.max(0, Math.min(3, Number(c.relevance) || 0));
+  const rel = "●".repeat(r) + "○".repeat(3 - r);
+  // The link text is the indexed title; the method name is written by the model (or the heuristic), so it is a label under it.
+  const title = cite.title || c.method_name;
+  const method = c.method_name && c.method_name !== title ? `<div class="small"><span class="faint">Method:</span> ${esc(c.method_name)}</div>` : "";
   return `<div class="method"${hidden ? " hidden" : ""}>
-    <a class="title" href="${esc(cite.url)}" target="_blank" rel="noopener">${esc(c.method_name)}</a>
+    <a class="title" href="${esc(cite.url)}" target="_blank" rel="noopener">${esc(title)}</a>
+    ${method}
     <div class="meta">${esc(authors || "Unknown authors")} · ${esc(cite.year || "n.d.")}${cite.venue ? ` · ${esc(cite.venue)}` : ""}</div>
     ${c.mechanism ? `<p class="mech">${esc(c.mechanism)}</p>` : ""}
-    <div class="tags">${c.verified ? `<span class="badge badge-verified" title="ID resolves in a scholarly index">✓ verified</span>` : `<span class="badge">unverified</span>`}${flags}
+    <div class="tags">${c.verified ? `<span class="badge badge-verified" title="Has an arXiv ID or DOI from a scholarly index">✓ verified</span>` : `<span class="badge">unverified</span>`}${flags}
       <span class="badge" title="${esc(c.relevance_reason)}">relevance <span class="rel">${rel}</span></span></div>
   </div>`;
 }
@@ -561,18 +690,19 @@ function methodCard(c, hidden) {
 // ---------- C. Architectures
 
 function sectionC(run) {
-  const cands = run.results.candidates;
-  const st = run.stages.find((s) => s.key === "design");
-  if (!cands) return head("C", "Candidate architectures") + waiting(st.status === "running" ? "Designing candidates…" : "Waiting for research…");
-  const cards = cardIndex(run);
-  const winner = run.results.verdict?.recommended_id;
-  const gen = [...new Set(cands.map((c) => c.generated_by))];
-  const offline = gen.every((g) => g.includes("heuristic"));
+  const report = run.report;
+  if (!report) return head("C", "Candidate architectures") + stageWait(run, "design_candidates", "Designing candidates…", "Waiting for research…");
+  const cands = report.candidates || [];
+  const cards = cardIndex(report);
+  const winner = report.verdict?.recommended_id;
+  const heuristic = (c) => String(c.generated_by).includes("heuristic");
+  const offline = cands.every(heuristic);
+  const mixed = !offline && cands.some((c) => c.role === "candidate" && heuristic(c));
   return `${head(
     "C",
     "Candidate architectures",
     "Each diagram is drawn from the same graph that runs in the race, so it can't drift from what was tested.",
-    pill(offline ? "offline" : "nemotron", offline ? "OFFLINE DESIGNS" : "NEMOTRON DESIGNS"),
+    offline ? pill("offline", "OFFLINE DESIGNS") : mixed ? pill("mixed", "PARTLY OFFLINE DESIGNS") : pill("nemotron", "NEMOTRON DESIGNS"),
   )}
   ${tierLegend()}
   <div class="grid grid-2">${cands
@@ -581,16 +711,17 @@ function sectionC(run) {
       return `<div class="card arch${c.id === winner ? " winner" : ""}">
       <div class="arch-head"><div><h3>${esc(designName(c))}</h3><div class="id">${esc(c.id)}</div></div>
         <div class="row" style="gap:6px;justify-content:flex-end">${c.id === winner ? `<span class="badge badge-win">recommended</span>` : ""}
+        ${c.raced === false ? `<span class="badge">not raced</span>` : ""}
         <span class="badge badge-role-${esc(c.role)}" title="${esc(ROLE_HINTS[c.role] || "")}">${esc(ROLE_NAMES[c.role] || c.role)}</span></div></div>
       ${diagram(c.mermaid)}
-      <div class="row" style="gap:6px">${(c.tiers || []).map(tier).join("")}<span class="small muted">${esc(c.description)}</span></div>
+      <div class="row" style="gap:6px">${tiersOf(c).map(tier).join("")}<span class="small muted">${esc(c.description)}</span></div>
       <p class="small">${esc(c.rationale)}</p>
       <div class="based-on">${
         based.length
           ? `<b>Based on</b><ol>${based
-              .map((b) => `<li><a href="${esc(b.citation.url)}" target="_blank" rel="noopener">${esc(b.method_name)}</a> <span class="faint">(${esc(b.citation.year || "n.d.")})</span>${b.verified ? ` <span class="badge badge-verified">✓</span>` : ""}</li>`)
+              .map((b) => `<li><a href="${esc(b.citation.url)}" target="_blank" rel="noopener">${esc(b.citation.title || b.method_name)}</a> <span class="faint">(${esc(b.citation.year || "n.d.")})</span>${b.verified ? ` <span class="badge badge-verified" title="Has an arXiv ID or DOI from a scholarly index">✓</span>` : ""}</li>`)
               .join("")}</ol>`
-          : `<span class="faint">${c.role === "baseline" ? "Reference point, not drawn from a paper." : "No matching sources found for this family."}</span>`
+          : `<span class="faint">${c.role === "baseline" ? "Reference point, not drawn from a paper." : c.role === "llm-default" ? "What an LLM usually recommends from memory." : "No matching sources found for this family."}</span>`
       }</div>
     </div>`;
     })
@@ -599,94 +730,303 @@ function sectionC(run) {
 
 // ---------- D. Race
 
-function sectionD(run) {
-  const st = Object.fromEntries(run.stages.map((s) => [s.key, s]));
-  const race = run.results.race;
-  const mock = run.race_provenance === "mock";
-  const pills = pill(mock ? "mock" : "measured", mock ? "MOCK RACE" : "MEASURED");
-  if (!race) {
-    if (st.race.status === "skipped")
-      return `${head("D", "The race", "")}<div class="card skeleton">No labelled examples, so there was nothing to race. <a href="/new" data-link>Add examples</a> to get a measured verdict.</div>${receiptAndLimits(run)}`;
-    return head("D", "The race", "", pills) + waiting(st.race.status === "running" ? `Racing: ${st.race.detail || "starting"}` : "Waiting for designs…");
-  }
-  const cands = Object.fromEntries((run.results.candidates || []).map((c) => [c.id, c]));
-  const rows = [...race.designs].sort((a, b) => (a.eliminated_round != null) - (b.eliminated_round != null) || b.accuracy - a.accuracy);
+function raceBoard(race, report, extraRows = []) {
+  const mock = isMock(report);
+  const cands = Object.fromEntries((report.candidates || []).map((c) => [c.id, c]));
+  const lineage = report.breeding?.lineage || {};
+  const rank = (d) => (d.eliminated_round != null ? 2 : d.accuracy == null ? 1 : 0);
+  const rows = [...race.designs].sort((a, b) => rank(a) - rank(b) || (b.accuracy ?? -1) - (a.accuracy ?? -1));
   const rec = race.recommended_id;
-  const tied = new Set(race.tied_ids);
-  const sub = `${race.task.n_examples} examples revealed in rounds at ${race.cutoffs.join(", ")}. After each round, designs that are confidently worse than the leader (paired bootstrap, 95%) are eliminated. Of the designs tied with the best, the cheapest wins.`;
-  const board = `<div class="card board">${mock ? `<div class="watermark">MOCK</div>` : ""}
+  const tied = new Set(race.tied_ids || []);
+  const inconclusive = new Set(race.inconclusive_ids || []);
+  const row = (d, outIn) => {
+    const out = outIn || d.eliminated_round != null;
+    const unmeasured = unmeasuredCount(d.unmeasured);
+    const errors = unmeasuredCount(d.errors);
+    const measured = d.accuracy != null;
+    const c = cands[d.id] || {};
+    const badges = [
+      d.id === rec && !outIn ? `<span class="badge badge-win">winner</span>` : "",
+      d.id !== rec && tied.has(d.id) && !outIn ? `<span class="badge badge-tied">tied</span>` : "",
+      inconclusive.has(d.id) && !outIn ? `<span class="badge" title="Neither shown worse than the best nor shown close to it">inconclusive</span>` : "",
+      outIn ? `<span class="badge badge-out">out in ${esc(outIn)}</span>` : d.eliminated_round != null ? `<span class="badge badge-out">out · round ${d.eliminated_round}</span>` : "",
+      lineage[d.id] ? `<span class="badge badge-bred" title="Bred from ${esc(lineage[d.id].parent_id)} via ${esc(lineage[d.id].mechanism)}">bred</span>` : "",
+      c.role && c.role !== "candidate" ? `<span class="badge badge-role-${esc(c.role)}">${esc(c.role)}</span>` : "",
+      !measured ? `<span class="badge badge-unmeasured">not measured</span>` : "",
+    ].join(" ");
+    const [lo, hi] = d.accuracy_ci || [null, null];
+    const ci = measured && lo != null && hi != null
+      ? `<div class="ci" title="${pct(lo)}–${pct(hi)}"><div class="track"></div>
+          <div class="range" style="left:${lo * 100}%;width:${Math.max(0.5, (hi - lo) * 100)}%"></div>
+          <div class="pt" style="left:${d.accuracy * 100}%"></div></div>
+          <div class="small" style="font-variant-numeric:tabular-nums"><b>${pct(d.accuracy)}</b> <span class="faint">(${pct(lo)}–${pct(hi)})</span></div>`
+      : `<div class="small faint">No accuracy: ${unmeasured ? `all ${unmeasured} runs` : "its runs"} failed for infrastructure reasons and were left unscored.</div>`;
+    const notes = [];
+    if (unmeasured && measured) notes.push(`${unmeasured} run${unmeasured === 1 ? "" : "s"} not measured (infrastructure errors), left out of the score`);
+    if (errors) notes.push(`${errors} run${errors === 1 ? "" : "s"} raised errors and were scored as wrong`);
+    if (out && d.elimination_reason) notes.push(`Eliminated: ${d.elimination_reason}`);
+    return `<div class="board-row${out ? " out" : ""}${d.id === rec && !outIn ? " win" : ""}">
+      <div class="name">${esc(designName(d))} ${badges}<span class="id">${esc(d.id)} · n=${d.n}</span>
+        <span class="tiers">${tiersOf(d).map(tier).join("")}</span></div>
+      <div class="ci-cell">${ci}</div>
+      <div class="num">${measured ? usd(d.cost_per_1k_usd) : "–"}${mock && measured ? "<small>simulated</small>" : ""}</div>
+      <div class="num">${secs(d.p50_latency_s)}${mock && d.p50_latency_s != null ? "<small>simulated</small>" : ""}</div>
+      ${notes.length ? `<div class="why">${notes.map(esc).join(" · ")}</div>` : ""}
+    </div>`;
+  };
+  return `<div class="card board">${mock ? `<div class="watermark">MOCK</div>` : ""}
     <div class="board-row head"><span>Design</span><span class="ci-cell">Accuracy · 95% CI</span><span class="num">$/1k</span><span class="num">p50</span></div>
-    ${rows
-      .map((d) => {
-        const out = d.eliminated_round != null;
-        const c = cands[d.id] || d;
-        const badges = [
-          d.id === rec ? `<span class="badge badge-win">winner</span>` : "",
-          d.id !== rec && tied.has(d.id) ? `<span class="badge badge-tied">tied</span>` : "",
-          out ? `<span class="badge badge-out">out · round ${d.eliminated_round}</span>` : "",
-          c.role && c.role !== "candidate" ? `<span class="badge badge-role-${esc(c.role)}">${esc(c.role)}</span>` : "",
-        ].join(" ");
-        const [lo, hi] = d.accuracy_ci;
-        return `<div class="board-row${out ? " out" : ""}${d.id === rec ? " win" : ""}">
-          <div class="name">${esc(designName(d))} ${badges}<span class="id">${esc(d.id)} · n=${d.n}</span></div>
-          <div class="ci-cell"><div class="ci" title="${pct(lo)}–${pct(hi)}"><div class="track"></div>
-            <div class="range" style="left:${lo * 100}%;width:${Math.max(0.5, (hi - lo) * 100)}%"></div>
-            <div class="pt" style="left:${d.accuracy * 100}%"></div></div>
-            <div class="small" style="font-variant-numeric:tabular-nums"><b>${pct(d.accuracy)}</b> <span class="faint">(${pct(lo)}–${pct(hi)})</span></div></div>
-          <div class="num">${usd(d.cost_per_1k_usd)}${mock ? "<small>simulated</small>" : ""}</div>
-          <div class="num">${secs(d.p50_latency_s)}${mock ? "<small>simulated</small>" : ""}</div>
-          ${out ? `<div class="why">Eliminated: ${esc(d.elimination_reason)}</div>` : ""}
+    ${rows.map((d) => row(d)).join("")}
+    ${extraRows.map(([d, role]) => row(d, role)).join("")}
+  </div>`;
+}
+
+function sectionD(run) {
+  const report = run.report;
+  const st = Object.fromEntries(run.stages.map((s) => [s.key, s]));
+  if (!report) {
+    const p = run.race_provenance === "measured" ? pill("measured", "MEASURED") : hasExamples(run) ? pill("mock", "MOCK RACE") : "";
+    return head("D", "The race", "", p) + stageWait(run, "race", "Racing the candidates…", "Waiting for designs…");
+  }
+  const race = report.race;
+  if (!race)
+    return `${head("D", "The race", "")}<div class="card skeleton">No labelled examples, so there was nothing to race. <a href="/new" data-link>Add examples</a> to get a measured verdict.</div>`;
+  const mock = isMock(report);
+  const pills = pill(mock ? "mock" : "measured", mock ? "MOCK RACE" : "MEASURED");
+  const races = report.breeding?.races?.length ? report.breeding.races : [race];
+  const sub = `Examples are revealed in rounds (${race.cutoffs.join(", ")}). After each round, designs that are confidently worse than the leader (exact sign test, corrected for multiple comparisons) are eliminated. Of the designs tied with the best, the cheapest wins.${
+    races.length > 1 ? ` ${races.length} races ran: the first on the generated candidates, then survivors plus bred designs.` : ""
+  }`;
+  // Designs eliminated in an earlier race are listed, faded, under the deciding race.
+  const finalIds = new Set(race.designs.map((d) => d.id));
+  const dropped = [];
+  const seen = new Set();
+  for (const past of races.slice(0, -1))
+    for (const d of past.designs)
+      if (!finalIds.has(d.id) && !seen.has(d.id)) {
+        seen.add(d.id);
+        dropped.push([d, past.role]);
+      }
+  let boards;
+  if (races.length > 1) {
+    const last = races.length - 1;
+    boards = `<div class="tabs" role="tablist">${races
+      .map((r, i) => `<button class="tab" role="tab" data-race-tab="${i}" aria-selected="${i === last}">${esc(r.role)} · ${r.task.n_examples} ex.${i === last ? " · deciding" : ""}</button>`)
+      .join("")}</div>
+      ${races
+        .map(
+          (r, i) => `<div data-race-panel="${i}"${i === last ? "" : " hidden"}>${i === last ? raceBoard(race, report, dropped) : raceBoard(r, report)}
+          ${i === last ? "" : `<p class="small muted mt">${esc(r.verdict)}</p>`}</div>`,
+        )
+        .join("")}`;
+  } else boards = raceBoard(race, report, dropped);
+  return `${head("D", "The race", sub, pills)}${boards}
+    ${race.aborted ? `<div class="banner"><span>⚠</span><div><strong>INCOMPLETE.</strong> ${esc(race.aborted)}</div></div>` : ""}
+    <p class="faint small mt">Decided in: <b>${esc(race.role)}</b>. ${st.race?.detail ? esc(st.race.detail) : ""}</p>`;
+}
+
+// ---------- E. Breeding
+
+function sectionE(run) {
+  const report = run.report;
+  const title = (pills = "") => head("E", "Diagnose & breed", "Why the losers failed, which fix from another field was tried, and how the bred design scored.", pills);
+  if (!report) {
+    const s = run.stages.find((x) => x.key === "breed") || {};
+    if (s.status === "skipped") return title() + `<div class="card skeleton">${esc(s.detail || "Skipped.")}</div>`;
+    return title() + stageWait(run, "race", "Racing, then diagnosing the losers and breeding fixes…", "Breeding runs after the first race.");
+  }
+  const b = report.breeding;
+  if (!b) return title() + `<div class="card skeleton">No labelled examples, so nothing was raced or bred.</div>`;
+  if (!b.enabled) return title() + `<div class="card skeleton">${esc(b.note)}</div>`;
+  const mock = isMock(report);
+  const help = b.failure_mode_help || {};
+  const bias = selectionBiasPresent(report);
+  const held = (b.holdout_ids || []).length;
+  const biasBox = `<div class="bias ${bias ? "bias-warn" : "bias-ok"}">
+      <div class="bias-title">${bias ? "⚠ Selection bias: bred scores are optimistic" : finalOnHoldout(b) ? "✓ Held-out confirmation" : "Selection bias"}</div>
+      <p>${esc(b.note)}</p>
+      ${held ? `<p class="small muted">Search split: ${(b.search_ids || []).length} examples · held-out split: ${held} examples.</p>` : ""}</div>`;
+
+  const final = report.race;
+  const finalRows = Object.fromEntries((final?.designs || []).map((d) => [d.id, d]));
+  const diagnoses = (b.diagnoses || []).flatMap((gen, gi) => gen.map((d) => ({ ...d, generation: gi + 1 })));
+  const diagHtml = diagnoses.length
+    ? `<div class="grid grid-2">${diagnoses
+        .map(
+          (d) => `<div class="card diag">
+        <div class="arch-head"><div><h3>${esc(d.design_id)}</h3><div class="id">${pct(d.accuracy)} on n=${d.n}${mock ? " (simulated)" : ""} · generation ${d.generation}</div></div>
+          <span class="badge" title="Who read the failures">${esc(d.produced_by)}</span></div>
+        <ul class="modes">${(d.failure_modes || [])
+          .map(
+            (m) => `<li><span class="mode" title="${esc(help[m.mode] || "")}">${esc(prettyMode(m.mode))}</span>${m.share ? ` <span class="faint small">${pct(m.share)} of examples</span>` : ""}
+              ${(m.evidence || []).length ? `<div class="small muted">${esc(m.evidence.join(" · "))}</div>` : ""}</li>`,
+          )
+          .join("")}</ul>
+        ${(d.sample_failures || []).length ? `<details class="small"><summary>${d.sample_failures.length} failure example${d.sample_failures.length === 1 ? "" : "s"}</summary><ul class="fails">${d.sample_failures
+          .map((f) => `<li><span class="muted">${esc(f.input)}</span><br>expected <b>${esc(f.expected)}</b>, got <b>${esc(f.got || (f.error ? "error" : "(empty)"))}</b>${f.error ? ` <span class="faint">${esc(f.error)}</span>` : ""}</li>`)
+          .join("")}</ul></details>` : ""}
+      </div>`,
+        )
+        .join("")}</div>`
+    : `<div class="card skeleton">No design had failures to diagnose.</div>`;
+
+  const bred = b.bred || [];
+  const bredHtml = bred.length
+    ? `${tierLegend()}<div class="grid grid-2">${bred
+        .map((d) => {
+          const m = d.mechanism || {};
+          const row = finalRows[d.id];
+          const win = d.id === report.verdict?.recommended_id;
+          let score;
+          if (!row) score = `<span class="faint">Not in the deciding race (eliminated earlier; see the race history in D).</span>`;
+          else if (row.accuracy == null) score = `<span class="faint">Not measured: its runs failed for infrastructure reasons.</span>`;
+          else
+            score = `<b>${pct(row.accuracy)}</b> <span class="faint">(95% CI ${ciText(row.accuracy_ci)}, n=${row.n})</span> · ${usd(row.cost_per_1k_usd)}/1k${mock ? ` <span class="sim">SIMULATED</span>` : ""}${
+              row.eliminated_round != null ? ` · <span class="faint">eliminated in round ${row.eliminated_round}</span>` : ""
+            }${bias ? ` <span class="badge badge-bias" title="Chosen using failures on the same examples it was raced on">optimistic</span>` : ""}`;
+          return `<div class="card arch${win ? " winner" : ""}">
+          <div class="arch-head"><div><h3>${esc(designName(d))}</h3><div class="id">${esc(d.id)}</div></div>
+            <div class="row" style="gap:6px;justify-content:flex-end">${win ? `<span class="badge badge-win">recommended</span>` : ""}<span class="badge badge-bred">bred</span></div></div>
+          <div class="mechanism"><div class="small faint">Fix borrowed from <b>${esc(m.field || "another field")}</b></div>
+            <div class="mech-name">${m.source?.url ? `<a href="${esc(m.source.url)}" target="_blank" rel="noopener">${esc(m.name)}</a>` : esc(m.name)}</div>
+            <div class="small muted">Applied to <code>${esc(d.parent_id)}</code> to fix <span class="mode" title="${esc(help[d.failure_mode] || "")}">${esc(prettyMode(d.failure_mode))}</span></div></div>
+          ${diagram(d.mermaid)}
+          <div class="row" style="gap:6px">${tiersOf(d).map(tier).join("")}<span class="small muted">${esc(d.description)}</span></div>
+          <div class="small">Score: ${score}</div>
         </div>`;
-      })
-      .join("")}
-  </div>`;
+        })
+        .join("")}</div>`
+    : `<div class="card skeleton">No mechanism produced a new design for these failures.</div>`;
 
-  const v = run.results.verdict;
-  const verdict = `<div class="card verdict"><div class="lbl faint small mono">VERDICT ${mock ? "· SIMULATED, NOT A RESULT" : ""}</div>
-    <div class="big">${esc(race.verdict)}</div>
-    ${v?.vs_llm_default ? `<p class="muted small">The design LLMs usually recommend, <code>${esc(v.vs_llm_default.id)}</code>, scored ${pct(v.vs_llm_default.accuracy)} at ${usd(v.vs_llm_default.cost_per_1k_usd)}/1k${v.vs_llm_default.eliminated ? `, and was eliminated: ${esc(v.vs_llm_default.elimination_reason)}` : ""}.</p>` : ""}
-  </div>`;
+  return `${title(pill(mock ? "mock" : "measured", mock ? "MOCK" : "MEASURED"))}${biasBox}
+    <h3 class="sub-head">Losers diagnosed</h3>${diagHtml}
+    <h3 class="sub-head">Bred designs</h3>${bredHtml}`;
+}
 
-  const adv = run.results.advisor;
-  let advisor = "";
-  if (adv) {
-    if (adv.available) {
-      const picked = race.designs.find((d) => d.id === adv.design_id);
-      advisor = `<div class="card advisor"><div class="row" style="justify-content:space-between"><b>LLM would have picked</b>${pill("nemotron", `NEMOTRON ${adv.model.toUpperCase()}`)}</div>
-        <p class="mt">${adv.design_id ? `<code>${esc(adv.design_id)}</code>${picked ? `: measured ${pct(picked.accuracy)} at ${usd(picked.cost_per_1k_usd)}/1k${adv.design_id === rec ? " (agrees with the race)" : picked.eliminated_round != null ? `, eliminated in round ${picked.eliminated_round}` : ""}` : ""}` : "No valid design named."}</p>
-        <details class="mt small"><summary>Full reply</summary><p class="muted" style="white-space:pre-wrap">${esc(adv.reply)}</p></details></div>`;
-    } else {
-      const d = race.designs.find((x) => x.id === adv.typical_default_id);
-      advisor = `<div class="card advisor"><div class="row" style="justify-content:space-between"><b>LLM would have picked</b>${pill("unavailable")}</div>
-        <p class="mt muted small">Asking Nemotron Ultra for its pick needs an API key. The design LLMs usually recommend is in the race as
-        <code>${esc(adv.typical_default_id || "–")}</code>${d ? `: ${pct(d.accuracy)} at ${usd(d.cost_per_1k_usd)}/1k${mock ? " (simulated)" : ""}` : ""}.</p></div>`;
+// ---------- F. Verdict, LLM pick, receipt and limitations
+
+function sectionF(run) {
+  const report = run.report;
+  if (!report) {
+    if (run.status === "error") return "";
+    return head("F", "Verdict & limitations") + stageWait(run, "llm_pick", "Asking the LLM which design it would pick…", "Waiting for the race…");
+  }
+  const v = report.verdict;
+  const mock = isMock(report);
+  const race = report.race;
+  const designs = Object.fromEntries((race?.designs || []).map((d) => [d.id, d]));
+  const verdict = `<div class="card verdict"><div class="lbl faint small mono">VERDICT ${mock ? "· SIMULATED, NOT A RESULT" : v.tested ? "· MEASURED" : "· UNTESTED"}</div>
+    <div class="big">${esc(v.headline)}</div>
+    ${
+      !v.vs_llm_default
+        ? ""
+        : unmeasured(v.vs_llm_default)
+          ? `<p class="muted small">The design LLMs usually recommend, <code>${esc(v.vs_llm_default.id)}</code>, was not measured: its runs failed for infrastructure reasons and were left unscored.</p>`
+          : `<p class="muted small">The design LLMs usually recommend, <code>${esc(v.vs_llm_default.id)}</code>, scored ${pct(v.vs_llm_default.accuracy)} (n=${v.vs_llm_default.n}) at ${usd(v.vs_llm_default.cost_per_1k_usd)}/1k${
+              v.vs_llm_default.eliminated ? `, and was eliminated: ${esc(v.vs_llm_default.elimination_reason)}` : ""
+            }${v.vs_llm_default.comparable ? "" : ` (measured in ${esc(v.vs_llm_default.measured_in)}, so not directly comparable)`}.</p>`
     }
-  } else if (st.advisor.status === "running") advisor = `<div class="card advisor"><span class="spinner"></span>Asking the LLM which design it would pick…</div>`;
+    ${v.recommended?.origin === "bred" && selectionBiasPresent(report) ? `<p class="small bias-inline">⚠ The recommendation is a bred design. Its score is optimistic until it is confirmed on held-out examples.</p>` : ""}
+  </div>`;
 
-  return `${head("D", "The race", sub, pills)}${board}${verdict}${advisor}${receiptAndLimits(run)}`;
+  const adv = report.advisor;
+  let advisor;
+  if (adv.available) {
+    const picked = v.advisor_pick?.measured || designs[adv.design_id];
+    const note = !picked
+      ? ""
+      : unmeasured(picked)
+        ? ": not measured (its runs failed for infrastructure reasons)"
+        : `: ${mock ? "simulated" : "measured"} ${pct(picked.accuracy)} at ${usd(picked.cost_per_1k_usd)}/1k${
+            adv.design_id === v.recommended_id ? " (agrees with the race)" : picked.eliminated || picked.eliminated_round != null ? ", eliminated" : ""
+          }${picked.comparable === false ? ` (measured in ${esc(picked.measured_in)})` : ""}`;
+    advisor = `<div class="card advisor"><div class="row" style="justify-content:space-between"><b>LLM would have picked</b>${pill("nemotron", `NEMOTRON ${String(adv.model).toUpperCase()}`)}</div>
+      <p class="mt">${adv.design_id ? `<code>${esc(adv.design_id)}</code>${note}` : "No valid design named."}</p>
+      <details class="mt small"><summary>Full reply</summary><p class="muted" style="white-space:pre-wrap">${esc(adv.reply)}</p></details></div>`;
+  } else {
+    const d = designs[adv.typical_default_id];
+    advisor = `<div class="card advisor"><div class="row" style="justify-content:space-between"><b>LLM would have picked</b>${pill("unavailable")}</div>
+      <p class="mt muted small">${esc(adv.reply)} ${
+        !adv.typical_default_id
+          ? ""
+          : !race
+            ? `The design LLMs usually recommend, <code>${esc(adv.typical_default_id)}</code>, would be raced once you add labelled examples.`
+            : `The design LLMs usually recommend is in the race as <code>${esc(adv.typical_default_id)}</code>${
+                !d ? "" : unmeasured(d) ? ": not measured (its runs failed for infrastructure reasons)" : `: ${pct(d.accuracy)} at ${usd(d.cost_per_1k_usd)}/1k${mock ? " (simulated)" : ""}`
+              }.`
+      }</p></div>`;
+  }
+  return `${head("F", "Verdict & limitations", "What to build, what an LLM would have said, what it cost and when not to trust it.")}${verdict}${advisor}${receiptAndLimits(run)}`;
+}
+
+const STAGE_NAMES = {
+  plain_llm_answer: "Plain-LLM answer (no search, no tests)",
+  research: "L1-L3 research: plan, search, method cards",
+  design_candidates: "L4 candidate designs + diagrams",
+  race: "L5 race + diagnose & breed",
+  llm_pick: "LLM advisor pick",
+  limitations: "L6 limitations",
+};
+
+function receiptLabel(e) {
+  if (e.status === "skipped" || e.produced_by === "none") return "unavailable";
+  if (e.produced_by === "mock") return "mock";
+  // A rejected model reply produced nothing in the output, so it does not earn the stage a NEMOTRON label.
+  const parts = String(e.produced_by)
+    .split("+")
+    .filter((p) => !p.includes("(rejected)"));
+  const offline = parts.filter((p) => p.startsWith("offline-heuristic")).length;
+  if (offline === parts.length) return "offline";
+  // Designs always include template reference points (baseline, LLM default), so a heuristic there is expected.
+  return offline && e.stage !== "design_candidates" ? "mixed" : "nemotron";
+}
+
+function producedBy(e) {
+  const models = health?.models || {};
+  return String(e.produced_by)
+    .split("+")
+    .map((p) => {
+      const key = p.split("(")[0];
+      if (p === "mock") return "MockClient (SIMULATED answers)";
+      if (p === "none") return "not run";
+      if (p === "offline-heuristic") return "offline heuristic";
+      return models[key] ? `Nemotron ${TIER_NAMES[key] || key}${p.includes("(") ? ` ${p.slice(p.indexOf("("))}` : ""}` : p;
+    })
+    .join(" + ");
 }
 
 function receiptAndLimits(run) {
-  if (run.status !== "done" && run.status !== "error") return "";
-  const total = run.receipt.reduce((s, r) => s + (r.cost_usd || 0), 0);
-  const receipt = `<div class="section-head mt" style="margin-top:28px"><h2 style="font-size:18px">Model receipt</h2><span class="sub">Which model or heuristic did each step, and what it cost.</span></div>
+  const report = run.report;
+  if (!report) return "";
+  const models = health?.models || {};
+  const receipt = `<div class="section-head mt" style="margin-top:28px"><h2 style="font-size:18px">Model receipt</h2><span class="sub">Which model or heuristic did each step, what it cost and how long it took.</span></div>
   <div class="card table-wrap"><table class="receipt"><thead><tr><th>Step</th><th>Done by</th><th>Label</th><th style="text-align:right">Cost</th></tr></thead><tbody>
-  ${run.receipt
-    .map(
-      (r) => `<tr><td>${esc(r.what)}</td><td>${esc(r.by)}${r.model_id ? `<div class="mid">${esc(r.model_id)}</div>` : ""}</td><td>${pill(r.provenance)}</td>
-      <td class="num">${usd(r.cost_usd)}${r.simulated_cost_usd != null ? `<div class="faint small">${usd(r.simulated_cost_usd)} simulated</div>` : ""}</td></tr>`,
-    )
+  ${report.model_receipt
+    .map((e) => {
+      const ids = String(e.produced_by)
+        .split("+")
+        .map((p) => models[p.split("(")[0]])
+        .filter(Boolean);
+      return `<tr><td>${esc(STAGE_NAMES[e.stage] || e.stage)}${e.detail ? `<div class="faint small">${esc(e.detail)}</div>` : ""}</td>
+      <td>${esc(producedBy(e))}${ids.length ? `<div class="mid">${esc(ids.join(", "))}</div>` : ""}</td><td>${pill(receiptLabel(e))}</td>
+      <td class="num">${usd(e.cost_usd)}${e.simulated_cost_usd != null ? `<div class="faint small">${usd(e.simulated_cost_usd)} SIMULATED</div>` : ""}<div class="faint small">${secs(e.seconds)}</div></td></tr>`;
+    })
     .join("")}
-  <tr><td colspan="3"><b>Total real spend</b></td><td class="num"><b>${usd(total)}</b></td></tr></tbody></table></div>`;
-  const limits = `<div class="card limits"><h3>⚠ When not to trust this verdict</h3><ul>${(run.limitations || []).map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`;
-  return receipt + limits;
+  <tr><td colspan="3"><b>Total real spend</b></td><td class="num"><b>${usd(report.total_cost_usd)}</b></td></tr></tbody></table></div>`;
+  const limits = `<div class="card limits"><h3>⚠ When not to trust this verdict</h3><ul>${(report.limitations || []).map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`;
+  const warnings = (report.warnings || []).length
+    ? `<details class="card warnings"><summary><b>${report.warnings.length} warning${report.warnings.length === 1 ? "" : "s"}</b> from this run</summary><ul>${report.warnings
+        .map((w) => `<li>${esc(w)}</li>`)
+        .join("")}</ul></details>`
+    : "";
+  return receipt + limits + warnings;
 }
 
 // ------------------------------------------------------------------ explore
 
 async function viewExplore(token) {
   app.innerHTML = `<div class="page-head"><h1>Explore architecture families</h1>
-    <p>The five patterns Wind Tunnel races today. Each diagram is generated from the same graph that runs, coloured by the Nemotron tier at each step.
+    <p>The architecture families Wind Tunnel races today. Each diagram is generated from the same graph that runs, coloured by the Nemotron tier at each step.
     None of them wins everywhere, which is why you measure.</p></div>${tierLegend()}<div class="grid grid-2" id="fams"><div class="card skeleton"><span class="spinner"></span>Loading…</div></div>`;
   const fams = await api("/api/families").catch(() => []);
   if (token !== routeToken) return;

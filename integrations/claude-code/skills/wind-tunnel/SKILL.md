@@ -19,13 +19,26 @@ several, self-check or voting, planner/executor, multi-agent, which Nemotron tie
    expected answers yourself. Pass `labels` when the answer set is fixed.
    Tell the user the examples are sent to the Wind Tunnel server and, on real runs, to Nebius
    Token Factory.
-4. **Race.** Call `start_race`. It returns a `job_id` at once.
+4. **Race.** Call `start_race`. It returns a `job_id` at once. It runs the whole pipeline:
+   research, candidates, the race, then diagnose-and-breed (`breed: true` by default; pass
+   `breed: false` for a single race).
 5. **Report.** Poll `get_report` until `status` is `done`: every 30-60 s for real races (they
-   take minutes), or after a few seconds for mock races.
-6. **Be honest about mode.** If `mode` / `provenance` is `mock`, or research `mode` is
-   `offline`, say so plainly. Mock numbers are simulated and must not drive the decision or be
-   quoted as results. If `do_not_quote` is true, don't quote the numbers.
-7. **Build.** For a measured result, implement the `recommended` design: follow its Mermaid
-   diagram (same steps, same model tiers, Nemotron via Nebius Token Factory). Add the race
-   examples as a regression test. Mention what the LLM advisor would have picked, and the
-   limitations.
+   take minutes), or after a few seconds for mock races. `progress.stages` shows which stage is
+   running.
+6. **Read `result.limitations` before acting on the verdict.** Every time, before you summarise,
+   recommend or write code. They are computed from this run and say when not to trust it: too
+   few examples, inconclusive or tied designs, early eliminations, errors, a spending cap that
+   stopped the race, and bred designs whose scores are optimistic. Pass the relevant ones on to
+   the user with the verdict.
+7. **Be honest about mode.** Check `result.labels`. If it contains `MOCK` or `SIMULATED`, the
+   race answers were simulated: say so plainly, and do not quote the numbers or choose a design
+   from them (`do_not_quote` is true). If it contains `OFFLINE`, the method cards and candidates
+   came from heuristics, not Nemotron. If `plain_llm` or `advisor` has `available: false`, say
+   it was not produced; never write a stand-in answer yourself.
+8. **Breeding.** If `result.breeding.bred` is not empty, tell the user which failure each bred
+   design targets (`mechanisms_applied`: mechanism, field, parent). If `selection_bias` starts
+   with "present", their scores are optimistic until confirmed on held-out examples.
+9. **Build.** Only for a `MEASURED` result with a `recommended` design: implement it by
+   following its Mermaid diagram and `tiers` (same steps, same model tiers, Nemotron via Nebius
+   Token Factory; a cascade needs both its cheap and its escalation tier). Add the race examples
+   as a regression test. Mention what the LLM advisor would have picked and the limitations.

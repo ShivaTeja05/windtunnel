@@ -17,7 +17,7 @@ class ResearchResult:
     scout: ScoutResult
     cards: list[MethodCard]
     warnings: list[str]
-    mode: str  # "nemotron" or "offline"
+    mode: str  # "nemotron", "mixed" (some outputs fell back to the heuristic) or "offline"
     finished_at: str
 
     def methods_map(self) -> dict[str, list[MethodCard]]:
@@ -43,6 +43,20 @@ class ResearchResult:
         }
 
 
+OFFLINE = "offline-heuristic"
+
+
+def research_mode(client: LLMClient | None, spec: ProblemSpec, cards: list[MethodCard]) -> str:
+    """What actually produced the plan and the cards, not just whether a client was passed."""
+    if client is None:
+        return "offline"
+    producers = [spec.produced_by] + [c.extracted_by for c in cards]
+    fallbacks = sum(p == OFFLINE for p in producers)
+    if fallbacks == len(producers):
+        return "offline"
+    return "mixed" if fallbacks else "nemotron"
+
+
 def research(
     problem: str,
     client: LLMClient | None = None,
@@ -60,7 +74,7 @@ def research(
         scout=found,
         cards=cards,
         warnings=found.warnings + extract_warnings,
-        mode="offline" if client is None else "nemotron",
+        mode=research_mode(client, spec, cards),
         finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
